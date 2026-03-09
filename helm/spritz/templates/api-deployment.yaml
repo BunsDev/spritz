@@ -194,6 +194,16 @@ spec:
               value: {{ join "," .Values.api.terminal.origins | quote }}
             {{- end }}
             {{- end }}
+            - name: SPRITZ_ACP_ENABLED
+              value: {{ .Values.acp.enabled | quote }}
+            - name: SPRITZ_ACP_PORT
+              value: {{ .Values.acp.port | quote }}
+            - name: SPRITZ_ACP_PATH
+              value: {{ .Values.acp.path | quote }}
+            {{- if .Values.api.acp.origins }}
+            - name: SPRITZ_ACP_ORIGINS
+              value: {{ join "," .Values.api.acp.origins | quote }}
+            {{- end }}
             {{- if hasKey .Values.api "sshGateway" }}
             - name: SPRITZ_SSH_GATEWAY_ENABLED
               value: {{ .Values.api.sshGateway.enabled | quote }}

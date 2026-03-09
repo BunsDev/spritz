@@ -51,6 +51,7 @@ var (
 type SpritzReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	ACP    ACPProbeConfig
 }
 
 type repoEntry struct {
@@ -191,7 +192,7 @@ func (r *SpritzReconciler) reconcileLifecycle(ctx context.Context, spritz *sprit
 	logger := log.FromContext(ctx)
 	if !spritz.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(spritz, spritzFinalizer) {
-			if err := r.setStatus(ctx, spritz, "Terminating", "", buildSSHInfo(spritz), "Deleting", "spritz deletion requested"); err != nil {
+			if err := r.setStatus(ctx, spritz, "Terminating", "", buildSSHInfo(spritz), "Deleting", "spritz deletion requested", deepCopyACPStatus(spritz.Status.ACP)); err != nil {
 				logger.Error(err, "failed to set terminating status")
 			}
 			controllerutil.RemoveFinalizer(spritz, spritzFinalizer)
@@ -373,7 +374,7 @@ func (r *SpritzReconciler) reconcileDeployment(ctx context.Context, spritz *spri
 }
 
 func (r *SpritzReconciler) reconcileService(ctx context.Context, spritz *spritzv1.Spritz) error {
-	if len(spritz.Spec.Ports) == 0 && !isWebEnabled(spritz) && !shouldExposeSSHService(spritz) {
+	if len(spritz.Spec.Ports) == 0 && !isWebEnabled(spritz) && !shouldExposeSSHService(spritz) && !shouldExposeACP(spritz) {
 		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: spritz.Name, Namespace: spritz.Namespace}}
 		if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
 			return err
@@ -551,25 +552,27 @@ func (r *SpritzReconciler) reconcileGatewayRoute(ctx context.Context, spritz *sp
 func (r *SpritzReconciler) reconcileStatus(ctx context.Context, spritz *spritzv1.Spritz) (*time.Duration, error) {
 	logger := log.FromContext(ctx)
 	now := time.Now()
+	sshInfo := buildSSHInfo(spritz)
 
 	if spritz.Spec.Ingress != nil && ingressMode(spritz) == "gateway" {
 		if spritz.Spec.Ingress.Host == "" {
-			return nil, r.setStatus(ctx, spritz, "Error", "", buildSSHInfo(spritz), "InvalidIngress", "ingress.host is required when ingress.mode=gateway")
+			return nil, r.setStatus(ctx, spritz, "Error", "", sshInfo, "InvalidIngress", "ingress.host is required when ingress.mode=gateway", deepCopyACPStatus(spritz.Status.ACP))
 		}
 		if spritz.Spec.Ingress.GatewayName == "" {
-			return nil, r.setStatus(ctx, spritz, "Error", "", buildSSHInfo(spritz), "InvalidIngress", "ingress.gatewayName is required when ingress.mode=gateway")
+			return nil, r.setStatus(ctx, spritz, "Error", "", sshInfo, "InvalidIngress", "ingress.gatewayName is required when ingress.mode=gateway", deepCopyACPStatus(spritz.Status.ACP))
 		}
 	}
 	for _, repo := range repoEntries(spritz) {
 		if err := validateRepoDir(repo.Dir); err != nil {
-			return nil, r.setStatus(ctx, spritz, "Error", "", buildSSHInfo(spritz), "InvalidRepoDir", err.Error())
+			return nil, r.setStatus(ctx, spritz, "Error", "", sshInfo, "InvalidRepoDir", err.Error(), deepCopyACPStatus(spritz.Status.ACP))
 		}
 	}
 
+	var statusRequeue *time.Duration
 	if spritz.Spec.TTL != "" {
 		ttl, err := time.ParseDuration(spritz.Spec.TTL)
 		if err != nil {
-			return nil, r.setStatus(ctx, spritz, "Error", "", buildSSHInfo(spritz), "InvalidTTL", "invalid ttl format")
+			return nil, r.setStatus(ctx, spritz, "Error", "", sshInfo, "InvalidTTL", "invalid ttl format", deepCopyACPStatus(spritz.Status.ACP))
 		}
 		expiry := spritz.CreationTimestamp.Add(ttl)
 		expiresAt := metav1.NewTime(expiry)
@@ -577,7 +580,7 @@ func (r *SpritzReconciler) reconcileStatus(ctx context.Context, spritz *spritzv1
 		grace := ttlGracePeriod()
 		deleteAt := expiry.Add(grace)
 		if now.After(deleteAt) {
-			if err := r.setStatus(ctx, spritz, "Expired", "", buildSSHInfo(spritz), "Expired", "ttl expired"); err != nil {
+			if err := r.setStatus(ctx, spritz, "Expired", "", sshInfo, "Expired", "ttl expired", deepCopyACPStatus(spritz.Status.ACP)); err != nil {
 				logger.Error(err, "failed to set expired status")
 			}
 			return nil, r.Delete(ctx, spritz)
@@ -588,11 +591,12 @@ func (r *SpritzReconciler) reconcileStatus(ctx context.Context, spritz *spritzv1
 				remaining = 0
 			}
 			message := fmt.Sprintf("ttl expired; deleting in %s", remaining.Round(time.Second))
-			if err := r.setStatus(ctx, spritz, "Expiring", spritzURL(spritz), buildSSHInfo(spritz), "Expiring", message); err != nil {
+			if err := r.setStatus(ctx, spritz, "Expiring", spritzURL(spritz), sshInfo, "Expiring", message, deepCopyACPStatus(spritz.Status.ACP)); err != nil {
 				return nil, err
 			}
 			return &remaining, nil
 		}
+		statusRequeue = durationPtr(time.Until(expiry))
 	} else {
 		spritz.Status.ExpiresAt = nil
 	}
@@ -600,7 +604,11 @@ func (r *SpritzReconciler) reconcileStatus(ctx context.Context, spritz *spritzv1
 	var deploy appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKey{Name: spritz.Name, Namespace: spritz.Namespace}, &deploy); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, r.setStatus(ctx, spritz, "Provisioning", "", buildSSHInfo(spritz), "Provisioning", "deployment not created yet")
+			acpStatus, _, acpErr := r.reconcileACPStatus(ctx, spritz, false)
+			if acpErr != nil {
+				logger.Error(acpErr, "failed to resolve ACP status while deployment is missing")
+			}
+			return nil, r.setStatus(ctx, spritz, "Provisioning", "", sshInfo, "Provisioning", "deployment not created yet", acpStatus)
 		}
 		return nil, err
 	}
@@ -615,11 +623,18 @@ func (r *SpritzReconciler) reconcileStatus(ctx context.Context, spritz *spritzv1
 		message = "spritz ready"
 	}
 
+	acpStatus, acpRequeue, acpErr := r.reconcileACPStatus(ctx, spritz, ready)
+	if acpErr != nil {
+		logger.Error(acpErr, "failed to probe ACP", "name", spritz.Name, "namespace", spritz.Namespace)
+	}
 	url := spritzURL(spritz)
-	return nil, r.setStatus(ctx, spritz, phase, url, buildSSHInfo(spritz), reason, message)
+	if err := r.setStatus(ctx, spritz, phase, url, sshInfo, reason, message, acpStatus); err != nil {
+		return nil, err
+	}
+	return minDurationPtr(statusRequeue, acpRequeue), nil
 }
 
-func (r *SpritzReconciler) setStatus(ctx context.Context, spritz *spritzv1.Spritz, phase, url string, sshInfo *spritzv1.SpritzSSHInfo, reason, message string) error {
+func (r *SpritzReconciler) setStatus(ctx context.Context, spritz *spritzv1.Spritz, phase, url string, sshInfo *spritzv1.SpritzSSHInfo, reason, message string, acpStatus *spritzv1.SpritzACPStatus) error {
 	conditionStatus := metav1.ConditionFalse
 	if phase == "Ready" {
 		conditionStatus = metav1.ConditionTrue
@@ -639,12 +654,66 @@ func (r *SpritzReconciler) setStatus(ctx context.Context, spritz *spritzv1.Sprit
 		spritz.Status.URL = url
 	}
 	spritz.Status.SSH = sshInfo
+	spritz.Status.ACP = deepCopyACPStatus(acpStatus)
+	setACPReadyCondition(&spritz.Status.Conditions, spritz.Generation, acpStatus)
 	if phase == "Ready" && spritz.Status.ReadyAt == nil {
 		now := metav1.Now()
 		spritz.Status.ReadyAt = &now
 	}
 
 	return r.Status().Update(ctx, spritz)
+}
+
+func setACPReadyCondition(conditions *[]metav1.Condition, generation int64, status *spritzv1.SpritzACPStatus) {
+	if status == nil {
+		meta.RemoveStatusCondition(conditions, "ACPReady")
+		return
+	}
+
+	condition := metav1.Condition{
+		Type:               "ACPReady",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: generation,
+		Reason:             "Unavailable",
+		Message:            "ACP is unavailable.",
+	}
+	switch status.State {
+	case "ready":
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = "Ready"
+		condition.Message = "ACP is ready."
+	case "unknown":
+		condition.Reason = "Unknown"
+		condition.Message = "ACP is waiting for the workspace to become ready."
+	case "probing":
+		condition.Reason = "Probing"
+		condition.Message = "ACP probe is in progress."
+	case "error":
+		condition.Reason = "Error"
+		condition.Message = status.LastError
+	default:
+		if strings.TrimSpace(status.LastError) != "" {
+			condition.Message = status.LastError
+		}
+	}
+	meta.SetStatusCondition(conditions, condition)
+}
+
+func minDurationPtr(left, right *time.Duration) *time.Duration {
+	switch {
+	case left == nil:
+		return right
+	case right == nil:
+		return left
+	case *left <= 0:
+		return right
+	case *right <= 0:
+		return left
+	case *left <= *right:
+		return left
+	default:
+		return right
+	}
 }
 
 func spritzURL(spritz *spritzv1.Spritz) string {
@@ -1192,9 +1261,13 @@ func shouldExposeSSHService(spritz *spritzv1.Spritz) bool {
 	return sshMode(spritz) != "gateway"
 }
 
+func shouldExposeACP(_ *spritzv1.Spritz) bool {
+	return true
+}
+
 func containerPorts(spritz *spritzv1.Spritz) []corev1.ContainerPort {
 	if len(spritz.Spec.Ports) == 0 && !isWebEnabled(spritz) {
-		if !isSSHEnabled(spritz) {
+		if !isSSHEnabled(spritz) && !shouldExposeACP(spritz) {
 			return nil
 		}
 	}
@@ -1203,6 +1276,13 @@ func containerPorts(spritz *spritzv1.Spritz) []corev1.ContainerPort {
 		ports := []corev1.ContainerPort{}
 		if isWebEnabled(spritz) {
 			ports = append(ports, corev1.ContainerPort{Name: "http", ContainerPort: defaultWebPort, Protocol: corev1.ProtocolTCP})
+		}
+		if shouldExposeACP(spritz) {
+			ports = append(ports, corev1.ContainerPort{
+				Name:          "acp",
+				ContainerPort: spritzv1.DefaultACPPort,
+				Protocol:      corev1.ProtocolTCP,
+			})
 		}
 		if isSSHEnabled(spritz) {
 			cfg := sshConfig(spritz)
@@ -1223,6 +1303,13 @@ func containerPorts(spritz *spritzv1.Spritz) []corev1.ContainerPort {
 			Protocol:      protocol,
 		})
 	}
+	if shouldExposeACP(spritz) && !hasSpecPortWithServicePort(spritz, spritzv1.DefaultACPPort, spritzv1.DefaultACPPort, "acp") {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          "acp",
+			ContainerPort: spritzv1.DefaultACPPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
 	if isSSHEnabled(spritz) {
 		cfg := sshConfig(spritz)
 		if !hasSpecPort(spritz, cfg.ContainerPort, "ssh") {
@@ -1240,6 +1327,14 @@ func servicePorts(spritz *spritzv1.Spritz) []corev1.ServicePort {
 				Name:       "http",
 				Port:       defaultWebPort,
 				TargetPort: intstrFromInt(defaultWebPort),
+				Protocol:   corev1.ProtocolTCP,
+			})
+		}
+		if shouldExposeACP(spritz) {
+			ports = append(ports, corev1.ServicePort{
+				Name:       "acp",
+				Port:       spritzv1.DefaultACPPort,
+				TargetPort: intstrFromInt(spritzv1.DefaultACPPort),
 				Protocol:   corev1.ProtocolTCP,
 			})
 		}
@@ -1270,6 +1365,14 @@ func servicePorts(spritz *spritzv1.Spritz) []corev1.ServicePort {
 			Port:       servicePort,
 			TargetPort: intstrFromInt(port.ContainerPort),
 			Protocol:   protocol,
+		})
+	}
+	if shouldExposeACP(spritz) && !hasSpecPortWithServicePort(spritz, spritzv1.DefaultACPPort, spritzv1.DefaultACPPort, "acp") {
+		ports = append(ports, corev1.ServicePort{
+			Name:       "acp",
+			Port:       spritzv1.DefaultACPPort,
+			TargetPort: intstrFromInt(spritzv1.DefaultACPPort),
+			Protocol:   corev1.ProtocolTCP,
 		})
 	}
 	if shouldExposeSSHService(spritz) {
@@ -1372,8 +1475,15 @@ func pathTypePtr(pathType netv1.PathType) *netv1.PathType {
 }
 
 func hasSpecPort(spritz *spritzv1.Spritz, port int32, name string) bool {
+	return hasSpecPortWithServicePort(spritz, port, 0, name)
+}
+
+func hasSpecPortWithServicePort(spritz *spritzv1.Spritz, containerPort, servicePort int32, name string) bool {
 	for _, specPort := range spritz.Spec.Ports {
-		if specPort.ContainerPort == port || specPort.Name == name {
+		if specPort.ContainerPort == containerPort || specPort.Name == name {
+			return true
+		}
+		if servicePort != 0 && specPort.ServicePort == servicePort {
 			return true
 		}
 	}

@@ -7,6 +7,15 @@ global:
       enabled: true
       secretName: ""
 
+acp:
+  enabled: true
+  port: 2529
+  path: /
+  probeTimeout: 3s
+  refreshInterval: 30s
+  networkPolicy:
+    enabled: false
+
 authGateway:
   enabled: false
   provider: oauth2-proxy
@@ -145,7 +154,7 @@ api:
   cors:
     origins: []
     allowHeaders: Content-Type,Authorization,X-Spritz-User-Id,X-Spritz-User-Email,X-Spritz-User-Teams
-    allowMethods: GET,POST,DELETE,OPTIONS
+    allowMethods: GET,POST,PUT,PATCH,DELETE,OPTIONS
     allowCredentials: true
   defaultIngress:
     mode: ""
@@ -159,6 +168,8 @@ api:
     enabled: true
     container: spritz
     command: "bash -l"
+    origins: []
+  acp:
     origins: []
   sshGateway:
     enabled: false

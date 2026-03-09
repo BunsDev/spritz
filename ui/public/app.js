@@ -33,10 +33,12 @@ const refreshBtn = document.getElementById('refresh');
 const form = document.getElementById('create-form');
 const randomNameBtn = document.getElementById('name-random');
 const shellEl = document.querySelector('.shell');
+const headerEl = shellEl?.querySelector('header');
 const createSection = form?.closest('section');
 const listSection = listEl?.closest('section');
 let activeTerminalSession = null;
 let activeTerminalName = '';
+let activeACPPage = null;
 let presetsInitialized = false;
 let activePresetEnv = null;
 const authRedirectStorageKey = 'spritz-auth-redirected';
@@ -46,6 +48,11 @@ let lastAuthRefreshAt = 0;
 let activeTerminalPoll = null;
 let knownSpritzNames = new Set();
 const presetPlaceholder = '__SPRITZ_UI_PRESETS__';
+const ACP_CLIENT_INFO = {
+  name: 'spritz-ui',
+  title: 'Spritz ACP UI',
+  version: '1.0.0',
+};
 const defaultPresets = [
   {
     name: 'Starter Devbox',
@@ -984,6 +991,16 @@ function renderList(items) {
       window.location.assign(terminalPagePath(name));
     };
 
+    const acpReady = spritz.status?.acp?.state === 'ready';
+    if (acpReady && spritzName) {
+      const chatBtn = document.createElement('button');
+      chatBtn.textContent = 'Chat';
+      chatBtn.onclick = () => {
+        window.location.assign(chatPagePath(spritzName));
+      };
+      actions.append(chatBtn);
+    }
+
     const sshMode = spritz.spec?.ssh?.mode;
     const sshInfo = spritz.status?.ssh;
     if (sshMode === 'gateway' && spritzName) {
@@ -1048,6 +1065,10 @@ function terminalPagePath(name) {
   return `#terminal/${encodeURIComponent(name)}`;
 }
 
+function chatPagePath(name = '') {
+  return window.SpritzACPPage.chatPagePath(name);
+}
+
 function terminalNameFromPath() {
   const hash = window.location.hash || '';
   const prefix = '#terminal/';
@@ -1056,20 +1077,25 @@ function terminalNameFromPath() {
   return decodeURIComponent(remainder.split('/')[0] || '');
 }
 
+function chatNameFromPath() {
+  return window.SpritzACPPage.chatNameFromHash(window.location.hash || '');
+}
+
+function setHeaderCopy(titleText, subtitleText) {
+  if (!headerEl) return;
+  const title = headerEl.querySelector('h1');
+  if (title) title.textContent = titleText;
+  const subtitle = headerEl.querySelector('p');
+  if (subtitle) subtitle.textContent = subtitleText;
+}
+
 function renderTerminalPage(name) {
   if (!shellEl) return;
   cleanupTerminal();
   activeTerminalName = name;
   if (createSection) createSection.hidden = true;
   if (listSection) listSection.hidden = true;
-
-  const header = shellEl.querySelector('header');
-  if (header) {
-    const title = header.querySelector('h1');
-    if (title) title.textContent = `Spritz · ${name}`;
-    const subtitle = header.querySelector('p');
-    if (subtitle) subtitle.textContent = 'Terminal session via gateway.';
-  }
+  setHeaderCopy(`Spritz · ${name}`, 'Terminal session via gateway.');
 
   const card = document.createElement('section');
   card.className = 'card terminal-card';
@@ -1299,106 +1325,57 @@ function sendResize(ws, term) {
   ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
 }
 
-function setupPresets() {
-  if (presetsInitialized) return;
-  if (!presets.length) return;
-  const imageInput = form.querySelector('input[name="image"]');
-  const repoInput = form.querySelector('input[name="repo"]');
-  const branchInput = form.querySelector('input[name="branch"]');
-  const ttlInput = form.querySelector('input[name="ttl"]');
-
-  if (!imageInput) return;
-  applyRepoDefaults();
-
-  const panel = document.createElement('div');
-  panel.className = 'preset-panel';
-
-  const label = document.createElement('label');
-  const select = document.createElement('select');
-  select.id = 'preset-select';
-
-  const customOption = document.createElement('option');
-  customOption.value = '';
-  customOption.textContent = 'Custom';
-  select.append(customOption);
-
-  presets.forEach((preset, index) => {
-    const option = document.createElement('option');
-    option.value = String(index);
-    option.textContent = `${preset.name} (${preset.image})`;
-    select.append(option);
-  });
-
-  const help = document.createElement('small');
-  help.className = 'preset-help';
-  help.textContent = presets[0]?.description || '';
-
-  label.append('Preset', select);
-  panel.append(label, help);
-  form.prepend(panel);
-
-  const applyPreset = (preset) => {
-    if (!preset) return;
-    imageInput.value = preset.image || '';
-    if (!hideRepoInputs) {
-      if (repoInput && preset.repoUrl !== undefined) repoInput.value = preset.repoUrl || '';
-      if (branchInput && preset.branch !== undefined) branchInput.value = preset.branch || '';
-    }
-    if (ttlInput && preset.ttl !== undefined) ttlInput.value = preset.ttl || '';
-    help.textContent = preset.description || '';
-    activePresetEnv = normalizePresetEnv(preset.env);
-  };
-
-  select.addEventListener('change', () => {
-    if (!select.value) {
-      help.textContent = '';
-      activePresetEnv = null;
-      return;
-    }
-    const preset = presets[Number(select.value)];
-    applyPreset(preset);
-  });
-
-  if (!imageInput.value && presets[0]) {
-    select.value = '0';
-    applyPreset(presets[0]);
-  }
-
-  presetsInitialized = true;
+function renderACPPage(name) {
+  activeACPPage = window.SpritzACPPage.renderACPPage(
+    name,
+    window.SpritzACPPage.conversationIdFromHash(window.location.hash || ''),
+    {
+      activePage: activeACPPage,
+      apiBaseUrl,
+      authBearerTokenParam,
+      getAuthToken,
+      request,
+      showNotice,
+      buildOpenUrl,
+      cleanupTerminal,
+      shellEl,
+      createSection,
+      listSection,
+      setHeaderCopy,
+    },
+  );
 }
 
-function cleanupTerminal() {
-  if (activeTerminalSession) {
-    activeTerminalSession.dispose();
-    activeTerminalSession = null;
+function cleanupACP() {
+  if (activeACPPage) {
+    activeACPPage.destroy();
+    activeACPPage = null;
   }
-  if (activeTerminalPoll) {
-    activeTerminalPoll.cancelled = true;
-    activeTerminalPoll = null;
-  }
-  const terminalCard = document.querySelector('.terminal-card');
-  if (terminalCard) terminalCard.remove();
-  if (createSection) createSection.hidden = false;
-  if (listSection) listSection.hidden = false;
-  activeTerminalName = '';
 }
 
 function handleRoute() {
+  const chatName = chatNameFromPath();
+  if (window.location.hash === '#chat' || chatName) {
+    renderACPPage(chatName);
+    return;
+  }
   const terminalName = terminalNameFromPath();
-    if (terminalName) {
-      renderTerminalPage(terminalName);
-    } else {
-      if (activeTerminalName) cleanupTerminal();
-      if (form && refreshBtn) {
-        applyNameDefaults();
-        applyRepoDefaults();
-        applyUserConfigDefaults();
-        setupPresets();
-        fetchSpritzes();
-      }
+  if (terminalName) {
+    cleanupACP();
+    renderTerminalPage(terminalName);
+  } else {
+    if (activeTerminalName) cleanupTerminal();
+    if (activeACPPage) cleanupACP();
+    setHeaderCopy('Spritz', 'Ephemeral dev environments, managed by API.');
+    if (form && refreshBtn) {
+      applyNameDefaults();
+      applyRepoDefaults();
+      applyUserConfigDefaults();
+      setupPresets();
+      fetchSpritzes();
     }
   }
-
+}
 window.addEventListener('hashchange', handleRoute);
 
 if (form && refreshBtn) {

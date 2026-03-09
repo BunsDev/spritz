@@ -40,6 +40,7 @@ type server struct {
 	sshGateway        sshGatewayConfig
 	sshDefaults       sshDefaults
 	sshMintLimiter    *sshMintLimiter
+	acp               acpConfig
 	defaultMetadata   map[string]string
 	sharedMounts      sharedMountsConfig
 	sharedMountsStore *sharedMountsStore
@@ -78,6 +79,7 @@ func main() {
 	auth := newAuthConfig()
 	ingressDefaults := newIngressDefaults()
 	terminal := newTerminalConfig()
+	acp := newACPConfig()
 	sshDefaults := newSSHDefaults()
 	sshGateway, err := newSSHGatewayConfig()
 	if err != nil {
@@ -123,6 +125,7 @@ func main() {
 		sshGateway:        sshGateway,
 		sshDefaults:       sshDefaults,
 		sshMintLimiter:    sshMintLimiter,
+		acp:               acp,
 		defaultMetadata:   defaultAnnotations,
 		sharedMounts:      sharedMounts,
 		sharedMountsStore: sharedStore,
@@ -191,6 +194,12 @@ func (s *server) registerRoutes(e *echo.Echo) {
 	secured.GET("/spritzes/:name", s.getSpritz)
 	secured.DELETE("/spritzes/:name", s.deleteSpritz)
 	secured.PATCH("/spritzes/:name/user-config", s.updateUserConfig)
+	secured.GET("/acp/agents", s.listACPAgents)
+	secured.GET("/acp/conversations", s.listACPConversations)
+	secured.POST("/acp/conversations", s.createACPConversation)
+	secured.GET("/acp/conversations/:id", s.getACPConversation)
+	secured.PATCH("/acp/conversations/:id", s.updateACPConversation)
+	secured.GET("/acp/connect/:name", s.openACPConnection)
 	secured.POST("/spritzes/:name/ssh", s.mintSSHCert)
 	if s.terminal.enabled {
 		secured.GET("/spritzes/:name/terminal", s.openTerminal)
