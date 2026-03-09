@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="docs/assets/agentol.svg" alt="Spritz" width="180">
-</p>
-
 # Spritz
+
+<p align="center">
+  <img src="docs/assets/agentol.svg" alt="Spritz" width="128">
+</p>
 
 <p align="center">
   <strong>Programmable open-source agent orchestrator</strong>
