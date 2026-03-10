@@ -22,6 +22,18 @@ const DEFAULTS = {
 };
 
 const WEBSOCKET_OPEN = 1;
+const DEFAULT_CLIENT_CAPABILITIES = Object.freeze({
+  auth: {
+    terminal: true,
+    _meta: {
+      gateway: true,
+    },
+  },
+  _meta: {
+    "terminal-auth": true,
+    terminal_output: true,
+  },
+});
 
 function trimPath(value, fallback) {
   const next = typeof value === "string" ? value.trim() : "";
@@ -162,6 +174,76 @@ function ensureLine(data) {
     : Buffer.concat([payload, Buffer.from("\n")]);
 }
 
+function parseACPMessage(line) {
+  try {
+    return JSON.parse(line);
+  } catch (error) {
+    return {
+      jsonrpc: "2.0",
+      invalid: true,
+      error,
+      raw: line,
+    };
+  }
+}
+
+function cloneACPValue(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function buildDefaultInitializeRequest(config) {
+  return {
+    protocolVersion: 1,
+    clientCapabilities: cloneACPValue(DEFAULT_CLIENT_CAPABILITIES),
+    clientInfo: {
+      name: config.metadata?.agentInfo?.name || DEFAULTS.agentName,
+      title: config.metadata?.agentInfo?.title || DEFAULTS.agentTitle,
+      version: config.metadata?.agentInfo?.version || "1.0.0",
+    },
+  };
+}
+
+function normalizeInitializeRequest(config, request) {
+  const fallback = buildDefaultInitializeRequest(config);
+  const params = request && typeof request === "object" ? request : {};
+  return {
+    protocolVersion: Number.isInteger(params.protocolVersion) ? params.protocolVersion : fallback.protocolVersion,
+    clientCapabilities:
+      params.clientCapabilities && typeof params.clientCapabilities === "object"
+        ? cloneACPValue(params.clientCapabilities)
+        : fallback.clientCapabilities,
+    clientInfo:
+      params.clientInfo && typeof params.clientInfo === "object"
+        ? {
+            name: String(params.clientInfo.name || fallback.clientInfo.name),
+            title: String(params.clientInfo.title || fallback.clientInfo.title),
+            version: String(params.clientInfo.version || fallback.clientInfo.version),
+          }
+        : fallback.clientInfo,
+  };
+}
+
+function normalizeInitializeResult(config, result) {
+  const fallback = config.metadata || {};
+  const payload = result && typeof result === "object" ? result : {};
+  return {
+    protocolVersion: Number.isInteger(payload.protocolVersion)
+      ? payload.protocolVersion
+      : fallback.protocolVersion || 1,
+    agentCapabilities:
+      payload.agentCapabilities && typeof payload.agentCapabilities === "object"
+        ? cloneACPValue(payload.agentCapabilities)
+        : cloneACPValue(fallback.agentCapabilities || {}),
+    agentInfo:
+      payload.agentInfo && typeof payload.agentInfo === "object"
+        ? cloneACPValue(payload.agentInfo)
+        : cloneACPValue(fallback.agentInfo || {}),
+    authMethods: Array.isArray(payload.authMethods)
+      ? cloneACPValue(payload.authMethods)
+      : cloneACPValue(fallback.authMethods || []),
+  };
+}
+
 function closeChild(child, timerRef) {
   if (child.exitCode !== null || child.killed) {
     return;
@@ -188,6 +270,11 @@ class ACPRuntime {
     this.child = null;
     this.killTimer = { current: null };
     this.socket = null;
+    this.internalRequestID = 1;
+    this.internalPending = new Map();
+    this.initialized = false;
+    this.initializing = null;
+    this.initializeResult = null;
   }
 
   ensureStarted() {
@@ -202,8 +289,25 @@ class ACPRuntime {
     child.stdout.on(
       "data",
       createLineForwarder((line) => {
+        const message = parseACPMessage(line);
+        if (message.invalid) {
+          this.logger.error?.(`[claude-code-acp] invalid JSON from adapter: ${message.raw}`);
+          return;
+        }
+        if (message.id !== undefined) {
+          const pending = this.internalPending.get(String(message.id));
+          if (pending) {
+            this.internalPending.delete(String(message.id));
+            if (message.error) {
+              pending.reject(message.error);
+            } else {
+              pending.resolve(message.result);
+            }
+            return;
+          }
+        }
         if (this.socket?.readyState === WEBSOCKET_OPEN) {
-          this.socket.send(line);
+          this.socket.send(JSON.stringify(message));
         }
       }),
     );
@@ -214,18 +318,78 @@ class ACPRuntime {
     child.on("error", (error) => {
       this.logger.error?.(`claude-agent-acp failed to start: ${String(error)}`);
       this.closeSocket(1011, "claude-agent-acp failed to start");
+      this.rejectInternalRequests({
+        code: -32000,
+        message: `claude-agent-acp failed to start: ${String(error)}`,
+      });
       this.child = null;
+      this.initialized = false;
+      this.initializing = null;
+      this.initializeResult = null;
     });
     child.on("exit", (code, signal) => {
       if (this.killTimer.current) {
         clearTimeout(this.killTimer.current);
       }
       this.child = null;
+      this.initialized = false;
+      this.initializing = null;
+      this.initializeResult = null;
+      this.rejectInternalRequests({
+        code: -32000,
+        message: signal ? `signal ${signal}` : `exit code ${code ?? 0}`,
+      });
       const status = signal ? `signal ${signal}` : `exit code ${code ?? 0}`;
       this.logger.warn?.(`claude-agent-acp exited with ${status}`);
       this.closeSocket(1011, `claude-agent-acp exited with ${status}`);
     });
     this.child = child;
+  }
+
+  rejectInternalRequests(error) {
+    for (const pending of this.internalPending.values()) {
+      pending.reject(error);
+    }
+    this.internalPending.clear();
+  }
+
+  requestChild(method, params) {
+    this.ensureStarted();
+    return new Promise((resolve, reject) => {
+      const id = `spritz-runtime-${this.internalRequestID++}`;
+      this.internalPending.set(String(id), { resolve, reject });
+      this.child.stdin.write(
+        ensureLine(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+          }),
+        ),
+      );
+    });
+  }
+
+  async ensureInitialized(request) {
+    if (this.initialized) {
+      return this.initializeResult;
+    }
+    if (this.initializing) {
+      await this.initializing;
+      return this.initializeResult;
+    }
+    const initializeRequest = normalizeInitializeRequest(this.config, request);
+    this.initializing = this.requestChild("initialize", initializeRequest)
+      .then((result) => {
+        this.initializeResult = normalizeInitializeResult(this.config, result);
+        this.initialized = true;
+        return this.initializeResult;
+      })
+      .finally(() => {
+        this.initializing = null;
+      });
+    return this.initializing;
   }
 
   closeSocket(code, reason) {
@@ -237,14 +401,37 @@ class ACPRuntime {
 
   attach(socket) {
     if (this.socket && this.socket.readyState === WEBSOCKET_OPEN) {
-      socket.close(1013, "another ACP client is already attached");
-      return;
+      this.socket.close(1001, "ACP client replaced");
     }
     this.ensureStarted();
     this.socket = socket;
-    socket.on("message", (data) => {
-      if (this.child?.stdin && !this.child.stdin.destroyed) {
-        this.child.stdin.write(ensureLine(data));
+    socket.on("message", async (data) => {
+      try {
+        const payload = parseACPMessage(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
+        if (payload.invalid) {
+          socket.close(1002, "invalid ACP JSON");
+          return;
+        }
+        if (payload.method === "initialize" && payload.id !== undefined) {
+          const result = await this.ensureInitialized(payload.params);
+          if (socket.readyState === WEBSOCKET_OPEN) {
+            socket.send(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: payload.id,
+                result,
+              }),
+            );
+          }
+          return;
+        }
+        await this.ensureInitialized();
+        if (this.child?.stdin && !this.child.stdin.destroyed) {
+          this.child.stdin.write(ensureLine(JSON.stringify(payload)));
+        }
+      } catch (error) {
+        this.logger.error?.(`claude-code ACP bridge error: ${String(error?.message || error)}`);
+        socket.close(1011, "claude-code ACP bridge error");
       }
     });
     socket.on("close", () => {
@@ -338,6 +525,8 @@ async function main(env = process.env, logger = console) {
     }
     shuttingDown = true;
     runtime.stop();
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
     server.close(() => {
       process.exit(0);
     });
