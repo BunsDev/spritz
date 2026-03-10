@@ -537,7 +537,9 @@
   }
 
   function applyACPUpdate(page, update) {
-    const result = ACPRender.applySessionUpdate(page.transcript, update);
+    const result = ACPRender.applySessionUpdate(page.transcript, update, {
+      historical: !page.bootstrapComplete,
+    });
     if (result?.conversationTitle) {
       patchSelectedConversation(page, { title: result.conversationTitle }).catch(() => {});
     }
@@ -652,6 +654,11 @@
     });
     syncComposer(page);
     await page.client.start();
+    if (page.cacheHydratedTranscript && !page.cacheReplacedByReplay) {
+      page.transcript = ACPRender.createTranscript();
+      renderConversationList(page);
+      renderThread(page);
+    }
     page.bootstrapComplete = true;
     writeCachedConversationRecord(page);
     clearACPNotice(page);
