@@ -149,12 +149,9 @@ func normalizeCreateOwner(body *createRequest, principal principal, authEnabled 
 	return owner, nil
 }
 
-func validateProvisionerRequestSurface(body *createRequest, userConfigKeys map[string]json.RawMessage) error {
+func validateProvisionerRequestSurface(body *createRequest) error {
 	if body == nil {
 		return nil
-	}
-	if len(userConfigKeys) > 0 {
-		return fmt.Errorf("userConfig is not allowed for service principals")
 	}
 	if body.Spec.Owner.Team != "" {
 		return fmt.Errorf("spec.owner.team is not allowed")
@@ -235,7 +232,7 @@ func (p provisionerPolicy) validatePreset(presetID string) error {
 	return fmt.Errorf("preset is not allowed: %s", presetID)
 }
 
-func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, userConfigKeys map[string]json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
+func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
 	if !principalCanUseProvisionerFlow(principal) {
 		return "", errForbidden
 	}
@@ -244,11 +241,6 @@ func (s *server) validateProvisionerCreate(ctx context.Context, principal princi
 	}
 	if err := authorizeServiceAction(principal, scopeInstancesAssignOwner, true); err != nil {
 		return "", err
-	}
-	if principal.isService() {
-		if err := validateProvisionerRequestSurface(body, userConfigKeys); err != nil {
-			return "", err
-		}
 	}
 	if requestedNamespace && !s.provisioners.allowNamespaceOverride {
 		return "", fmt.Errorf("namespace override is not allowed")

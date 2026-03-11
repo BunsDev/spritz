@@ -317,6 +317,11 @@ func (s *server) createSpritz(c echo.Context) error {
 	body.Name = strings.TrimSpace(body.Name)
 	body.NamePrefix = strings.TrimSpace(body.NamePrefix)
 	applyTopLevelCreateFields(&body)
+	if principal.isService() {
+		if err := validateProvisionerRequestSurface(&body); err != nil {
+			return writeError(c, http.StatusBadRequest, err.Error())
+		}
+	}
 
 	requestedNamespace := strings.TrimSpace(body.Namespace) != ""
 	requestedImage := strings.TrimSpace(body.Spec.Image) != ""
@@ -412,7 +417,7 @@ func (s *server) createSpritz(c echo.Context) error {
 		if !nameProvided {
 			fingerprintName = ""
 		}
-		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, userConfigKeys, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
+		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
 		if err != nil {
 			if errors.Is(err, errForbidden) {
 				return writeError(c, http.StatusForbidden, "forbidden")

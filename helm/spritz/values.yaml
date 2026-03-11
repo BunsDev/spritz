@@ -162,7 +162,7 @@ api:
         - scope
         - scopes
         - scp
-      defaultType: service
+      defaultType: ""
   provisioners:
     defaultPresetId: ""
     allowedPresetIds: []

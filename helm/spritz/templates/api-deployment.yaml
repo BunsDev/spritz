@@ -112,8 +112,10 @@ spec:
             - name: SPRITZ_AUTH_BEARER_SCOPES_PATHS
               value: {{ join "," .Values.api.auth.bearer.scopesPaths | quote }}
             {{- end }}
+            {{- if .Values.api.auth.bearer.defaultType }}
             - name: SPRITZ_AUTH_BEARER_DEFAULT_TYPE
               value: {{ .Values.api.auth.bearer.defaultType | quote }}
+            {{- end }}
             {{- if .Values.api.auth.bearer.jwks.url }}
             - name: SPRITZ_AUTH_BEARER_JWKS_URL
               value: {{ .Values.api.auth.bearer.jwks.url | quote }}

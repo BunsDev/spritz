@@ -98,8 +98,13 @@ const (
 )
 
 func newAuthConfig() authConfig {
+	mode := normalizeAuthMode(os.Getenv("SPRITZ_AUTH_MODE"))
+	bearerDefaultType := principalTypeHuman
+	if mode == authModeAuto {
+		bearerDefaultType = principalTypeService
+	}
 	return authConfig{
-		mode:                      normalizeAuthMode(os.Getenv("SPRITZ_AUTH_MODE")),
+		mode:                      mode,
 		headerID:                  envOrDefault("SPRITZ_AUTH_HEADER_ID", "X-Spritz-User-Id"),
 		headerEmail:               envOrDefault("SPRITZ_AUTH_HEADER_EMAIL", "X-Spritz-User-Email"),
 		headerTeams:               envOrDefault("SPRITZ_AUTH_HEADER_TEAMS", "X-Spritz-User-Teams"),
@@ -119,7 +124,7 @@ func newAuthConfig() authConfig {
 		bearerTeamsPaths:          splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TEAMS_PATHS"), nil),
 		bearerTypePaths:           splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TYPE_PATHS"), nil),
 		bearerScopesPaths:         splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_SCOPES_PATHS"), []string{"scope", "scopes", "scp"}),
-		bearerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_BEARER_DEFAULT_TYPE", string(principalTypeService)), principalTypeService),
+		bearerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_BEARER_DEFAULT_TYPE", string(bearerDefaultType)), bearerDefaultType),
 		bearerAuthorizationHeader: envOrDefault("SPRITZ_AUTH_BEARER_HEADER", "Authorization"),
 		bearerJWKSURL:             strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_JWKS_URL")),
 		bearerJWKSIssuer:          strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_ISSUER")),
