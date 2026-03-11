@@ -40,6 +40,7 @@ const (
 	idempotencyReservationHashKey = "fingerprint"
 	idempotencyReservationNameKey = "spritzName"
 	idempotencyReservationDoneKey = "completed"
+	idempotencyReservationBodyKey = "payload"
 	defaultProvisionerSource      = "external"
 	defaultProvisionerIdleTTL     = 24 * time.Hour
 	defaultProvisionerMaxTTL      = 7 * 24 * time.Hour
@@ -114,6 +115,19 @@ type suggestNameMetadata struct {
 	presetID   string
 	namePrefix string
 	image      string
+}
+
+type idempotentCreatePayload struct {
+	PresetID   string              `json:"presetId,omitempty"`
+	NamePrefix string              `json:"namePrefix,omitempty"`
+	Source     string              `json:"source,omitempty"`
+	RequestID  string              `json:"requestId,omitempty"`
+	Spec       spritzv1.SpritzSpec `json:"spec"`
+}
+
+type provisionerIdempotencyState struct {
+	canonicalFingerprint string
+	resolvedPayload      string
 }
 
 func (s *server) applyCreatePreset(body *createRequest) (*runtimePreset, error) {
@@ -301,49 +315,65 @@ func (s *server) validateProvisionerPlacement(principal principal, namespace, pr
 	return nil
 }
 
-func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint, namePrefixForFingerprint string) (string, error) {
+func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, requestedImage, requestedRepo, requestedNamespace bool) error {
 	if err := s.validateProvisionerPlacement(principal, namespace, body.PresetID, requestedImage, requestedNamespace, scopeInstancesCreate); err != nil {
-		return "", err
+		return err
 	}
 	if err := authorizeServiceAction(principal, scopeInstancesAssignOwner, true); err != nil {
-		return "", err
+		return err
 	}
 	if requestedRepo && !s.provisioners.allowCustomRepo {
-		return "", fmt.Errorf("custom repo is not allowed")
+		return fmt.Errorf("custom repo is not allowed")
 	}
 	if body.IdempotencyKey == "" {
-		return "", fmt.Errorf("idempotencyKey is required")
+		return fmt.Errorf("idempotencyKey is required")
 	}
-	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, true); err != nil {
-		return "", err
-	}
-	return createFingerprint(body.Spec.Owner.ID, body.PresetID, nameForFingerprint, namePrefixForFingerprint, namespace, provisionerSource(body), body.Spec, userConfig)
+	return nil
 }
 
 func (s *server) enforceProvisionerQuotas(ctx context.Context, namespace string, principal principal, ownerID string) error {
-	list := &spritzv1.SpritzList{}
-	if err := s.client.List(ctx, list, client.InNamespace(namespace)); err != nil {
-		return err
+	if s.provisioners.maxActivePerOwner <= 0 && s.provisioners.maxCreatesPerActor <= 0 && s.provisioners.maxCreatesPerOwner <= 0 {
+		return nil
+	}
+	if s.provisioners.allowNamespaceOverride && len(s.provisioners.allowedNamespaces) == 0 &&
+		(s.provisioners.maxActivePerOwner > 0 || s.provisioners.maxCreatesPerActor > 0 || s.provisioners.maxCreatesPerOwner > 0) {
+		return fmt.Errorf("quota enforcement requires allowed namespaces when namespace override is enabled")
+	}
+	namespaces := []string{namespace}
+	if fixedNamespace := strings.TrimSpace(s.namespace); fixedNamespace != "" {
+		namespaces = []string{fixedNamespace}
+	} else if s.provisioners.allowNamespaceOverride && len(s.provisioners.allowedNamespaces) > 0 {
+		namespaces = namespaces[:0]
+		for allowedNamespace := range s.provisioners.allowedNamespaces {
+			namespaces = append(namespaces, allowedNamespace)
+		}
+		sort.Strings(namespaces)
 	}
 	activeForOwner := 0
 	actorCreates := 0
 	ownerCreates := 0
 	cutoff := time.Now().Add(-s.provisioners.rateWindow)
-	for _, item := range list.Items {
-		if item.DeletionTimestamp != nil {
-			continue
+	for _, listNamespace := range namespaces {
+		list := &spritzv1.SpritzList{}
+		if err := s.client.List(ctx, list, client.InNamespace(listNamespace)); err != nil {
+			return err
 		}
-		if item.Spec.Owner.ID == ownerID && item.Status.Phase != "Expired" {
-			activeForOwner++
-		}
-		if s.provisioners.rateWindow > 0 && item.CreationTimestamp.Time.Before(cutoff) {
-			continue
-		}
-		if item.Annotations[actorIDAnnotationKey] == principal.ID {
-			actorCreates++
-		}
-		if item.Spec.Owner.ID == ownerID {
-			ownerCreates++
+		for _, item := range list.Items {
+			if item.DeletionTimestamp != nil {
+				continue
+			}
+			if item.Spec.Owner.ID == ownerID && item.Status.Phase != "Expired" {
+				activeForOwner++
+			}
+			if s.provisioners.rateWindow > 0 && item.CreationTimestamp.Time.Before(cutoff) {
+				continue
+			}
+			if item.Annotations[actorIDAnnotationKey] == principal.ID {
+				actorCreates++
+			}
+			if item.Spec.Owner.ID == ownerID {
+				ownerCreates++
+			}
 		}
 	}
 	if s.provisioners.maxActivePerOwner > 0 && activeForOwner >= s.provisioners.maxActivePerOwner {
@@ -356,6 +386,45 @@ func (s *server) enforceProvisionerQuotas(ctx context.Context, namespace string,
 		return fmt.Errorf("owner create rate limit reached")
 	}
 	return nil
+}
+
+func createRequestFingerprint(body createRequest, namespace, name, namePrefix string, userConfig json.RawMessage) (string, error) {
+	return createFingerprint(
+		body.Spec.Owner.ID,
+		sanitizeSpritzNameToken(body.PresetID),
+		strings.TrimSpace(name),
+		sanitizeSpritzNameToken(namePrefix),
+		namespace,
+		provisionerSource(&body),
+		body.Spec,
+		userConfig,
+	)
+}
+
+func createResolvedProvisionerPayload(body createRequest, resolvedNamePrefix string) (string, error) {
+	payload := idempotentCreatePayload{
+		PresetID:   sanitizeSpritzNameToken(body.PresetID),
+		NamePrefix: sanitizeSpritzNameToken(resolvedNamePrefix),
+		Source:     provisionerSource(&body),
+		RequestID:  strings.TrimSpace(body.RequestID),
+		Spec:       body.Spec,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func decodeResolvedProvisionerPayload(raw string) (idempotentCreatePayload, error) {
+	payload := idempotentCreatePayload{}
+	if strings.TrimSpace(raw) == "" {
+		return payload, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return idempotentCreatePayload{}, err
+	}
+	return payload, nil
 }
 
 func newPresetCatalog() (presetCatalog, error) {
@@ -466,6 +535,67 @@ func (c presetCatalog) get(id string) (*runtimePreset, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (s *server) allowedProvisionerPresets() []runtimePreset {
+	items := s.presets.all()
+	if len(items) == 0 || len(s.provisioners.allowedPresetIDs) == 0 {
+		return items
+	}
+	filtered := make([]runtimePreset, 0, len(items))
+	for _, item := range items {
+		if _, ok := s.provisioners.allowedPresetIDs[item.ID]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func (s *server) resolvedCreateNamePrefix(body createRequest, explicitNamePrefix string) string {
+	if prefix := sanitizeSpritzNameToken(explicitNamePrefix); prefix != "" {
+		return prefix
+	}
+	if preset, ok := s.presets.get(body.PresetID); ok {
+		return resolvePresetNamePrefix("", *preset)
+	}
+	return resolveSpritzNamePrefix("", body.Spec.Image)
+}
+
+func (s *server) resolvedCreateFingerprint(body createRequest, namespace, explicitNamePrefix string, userConfig json.RawMessage) (string, error) {
+	namePrefix := ""
+	if strings.TrimSpace(body.Name) == "" {
+		namePrefix = s.resolvedCreateNamePrefix(body, explicitNamePrefix)
+	}
+	return createFingerprint(
+		body.Spec.Owner.ID,
+		sanitizeSpritzNameToken(body.PresetID),
+		strings.TrimSpace(body.Name),
+		sanitizeSpritzNameToken(namePrefix),
+		namespace,
+		provisionerSource(&body),
+		body.Spec,
+		userConfig,
+	)
+}
+
+func (s *server) provisionerIdempotencyFingerprints(requestBody, resolvedBody createRequest, namespace string, userConfig json.RawMessage) (provisionerIdempotencyState, error) {
+	canonicalName := strings.TrimSpace(requestBody.Name)
+	canonicalNamePrefix := ""
+	if canonicalName == "" {
+		canonicalNamePrefix = strings.TrimSpace(requestBody.NamePrefix)
+	}
+	canonicalFingerprint, err := createRequestFingerprint(requestBody, namespace, canonicalName, canonicalNamePrefix, userConfig)
+	if err != nil {
+		return provisionerIdempotencyState{}, err
+	}
+	resolvedPayload, err := createResolvedProvisionerPayload(resolvedBody, s.resolvedCreateNamePrefix(resolvedBody, requestBody.NamePrefix))
+	if err != nil {
+		return provisionerIdempotencyState{}, err
+	}
+	return provisionerIdempotencyState{
+		canonicalFingerprint: canonicalFingerprint,
+		resolvedPayload:      resolvedPayload,
+	}, nil
 }
 
 func newProvisionerPolicy() provisionerPolicy {
@@ -632,9 +762,30 @@ func (s *server) idempotencyReservationNamespace() string {
 	return "default"
 }
 
-func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace string, principal principal, key, fingerprint, desiredName string) (string, bool, error) {
+func (s *server) getIdempotencyReservation(ctx context.Context, actorID, key, fingerprint string) (string, bool, string, bool, error) {
+	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(key) == "" {
+		return "", false, "", false, nil
+	}
+	current := &corev1.ConfigMap{}
+	if err := s.client.Get(ctx, clientKey(s.idempotencyReservationNamespace(), idempotencyReservationName(actorID, key)), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, "", false, nil
+		}
+		return "", false, "", false, err
+	}
+	if strings.TrimSpace(current.Data[idempotencyReservationHashKey]) != strings.TrimSpace(fingerprint) {
+		return "", false, "", false, fmt.Errorf("idempotencyKey already used with a different request")
+	}
+	return strings.TrimSpace(current.Data[idempotencyReservationNameKey]),
+		strings.EqualFold(strings.TrimSpace(current.Data[idempotencyReservationDoneKey]), "true"),
+		strings.TrimSpace(current.Data[idempotencyReservationBodyKey]),
+		true,
+		nil
+}
+
+func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace string, principal principal, key, desiredName string, state provisionerIdempotencyState) (string, bool, string, error) {
 	if strings.TrimSpace(key) == "" {
-		return desiredName, false, nil
+		return desiredName, false, strings.TrimSpace(state.resolvedPayload), nil
 	}
 	reservationName := idempotencyReservationName(principal.ID, key)
 	reservationNamespace := s.idempotencyReservationNamespace()
@@ -648,43 +799,48 @@ func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace stri
 			},
 		},
 		Data: map[string]string{
-			idempotencyReservationHashKey: fingerprint,
+			idempotencyReservationHashKey: state.canonicalFingerprint,
 			idempotencyReservationNameKey: desiredName,
 			idempotencyReservationDoneKey: "false",
+			idempotencyReservationBodyKey: strings.TrimSpace(state.resolvedPayload),
 		},
 	}
 	if err := s.client.Create(ctx, record); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return "", false, err
+			return "", false, "", err
 		}
 		existing := &corev1.ConfigMap{}
 		if getErr := s.client.Get(ctx, clientKey(reservationNamespace, reservationName), existing); getErr != nil {
-			return "", false, getErr
+			return "", false, "", getErr
 		}
-		if strings.TrimSpace(existing.Data[idempotencyReservationHashKey]) != fingerprint {
-			return "", false, fmt.Errorf("idempotencyKey already used with a different request")
+		if strings.TrimSpace(existing.Data[idempotencyReservationHashKey]) != strings.TrimSpace(state.canonicalFingerprint) {
+			return "", false, "", fmt.Errorf("idempotencyKey already used with a different request")
 		}
 		done := strings.EqualFold(strings.TrimSpace(existing.Data[idempotencyReservationDoneKey]), "true")
 		name := strings.TrimSpace(existing.Data[idempotencyReservationNameKey])
+		storedPayload := strings.TrimSpace(existing.Data[idempotencyReservationBodyKey])
+		if storedPayload == "" {
+			return "", false, "", fmt.Errorf("idempotencyKey already used by an incompatible pending request")
+		}
 		if done {
 			if name == "" {
 				name = desiredName
 			}
-			return name, true, nil
+			return name, true, storedPayload, nil
 		}
 		if name == "" {
-			return s.setIdempotencyReservationName(ctx, principal.ID, key, fingerprint, "", desiredName)
+			return s.setIdempotencyReservationName(ctx, principal.ID, key, "", desiredName, state)
 		}
 		reservedSpritz, getErr := s.findReservedSpritz(ctx, namespace, name)
 		if getErr != nil {
-			return "", false, getErr
+			return "", false, "", getErr
 		}
-		if reservedSpritz != nil && !matchesIdempotentReplayTarget(reservedSpritz, principal, key, fingerprint) {
-			return s.setIdempotencyReservationName(ctx, principal.ID, key, fingerprint, name, desiredName)
+		if reservedSpritz != nil && !matchesIdempotentReplayTarget(reservedSpritz, principal, key, state.canonicalFingerprint) {
+			return s.setIdempotencyReservationName(ctx, principal.ID, key, name, desiredName, state)
 		}
-		return name, false, nil
+		return name, false, storedPayload, nil
 	}
-	return desiredName, false, nil
+	return desiredName, false, strings.TrimSpace(state.resolvedPayload), nil
 }
 
 func (s *server) completeIdempotencyReservation(ctx context.Context, actorID, key string, spritz *spritzv1.Spritz) error {
@@ -708,43 +864,51 @@ func (s *server) completeIdempotencyReservation(ctx context.Context, actorID, ke
 	return s.client.Update(ctx, current)
 }
 
-func (s *server) setIdempotencyReservationName(ctx context.Context, actorID, key, fingerprint, failedName, proposedName string) (string, bool, error) {
+func (s *server) setIdempotencyReservationName(ctx context.Context, actorID, key, failedName, proposedName string, state provisionerIdempotencyState) (string, bool, string, error) {
 	failedName = strings.TrimSpace(failedName)
 	proposedName = strings.TrimSpace(proposedName)
 	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(key) == "" {
-		return proposedName, false, nil
+		return proposedName, false, strings.TrimSpace(state.resolvedPayload), nil
 	}
 	reservationName := idempotencyReservationName(actorID, key)
 	reservationNamespace := s.idempotencyReservationNamespace()
 	selectedName := proposedName
 	completed := false
+	selectedPayload := strings.TrimSpace(state.resolvedPayload)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &corev1.ConfigMap{}
 		if err := s.client.Get(ctx, clientKey(reservationNamespace, reservationName), current); err != nil {
 			if apierrors.IsNotFound(err) {
 				selectedName = proposedName
 				completed = false
+				selectedPayload = strings.TrimSpace(state.resolvedPayload)
 				return nil
 			}
 			return err
 		}
-		if strings.TrimSpace(current.Data[idempotencyReservationHashKey]) != strings.TrimSpace(fingerprint) {
+		if strings.TrimSpace(current.Data[idempotencyReservationHashKey]) != strings.TrimSpace(state.canonicalFingerprint) {
 			return fmt.Errorf("idempotencyKey already used with a different request")
 		}
 		storedName := strings.TrimSpace(current.Data[idempotencyReservationNameKey])
 		done := strings.EqualFold(strings.TrimSpace(current.Data[idempotencyReservationDoneKey]), "true")
+		storedPayload := strings.TrimSpace(current.Data[idempotencyReservationBodyKey])
+		if storedPayload == "" {
+			return fmt.Errorf("idempotencyKey already used by an incompatible pending request")
+		}
 		if done {
 			if storedName == "" {
 				storedName = proposedName
 			}
 			selectedName = storedName
 			completed = true
+			selectedPayload = storedPayload
 			return nil
 		}
 		if storedName == "" {
 			if proposedName == "" {
 				selectedName = ""
 				completed = false
+				selectedPayload = storedPayload
 				return nil
 			}
 			if current.Data == nil {
@@ -757,11 +921,13 @@ func (s *server) setIdempotencyReservationName(ctx context.Context, actorID, key
 			}
 			selectedName = proposedName
 			completed = false
+			selectedPayload = storedPayload
 			return nil
 		}
 		if failedName == "" || storedName != failedName || proposedName == "" || proposedName == storedName {
 			selectedName = storedName
 			completed = false
+			selectedPayload = storedPayload
 			return nil
 		}
 		if current.Data == nil {
@@ -774,12 +940,16 @@ func (s *server) setIdempotencyReservationName(ctx context.Context, actorID, key
 		}
 		selectedName = proposedName
 		completed = false
+		selectedPayload = storedPayload
 		return nil
 	})
 	if err != nil {
-		return "", false, err
+		return "", false, "", err
 	}
-	return selectedName, completed, nil
+	if strings.TrimSpace(selectedPayload) == "" {
+		selectedPayload = strings.TrimSpace(state.resolvedPayload)
+	}
+	return selectedName, completed, selectedPayload, nil
 }
 
 func (s *server) findReservedSpritz(ctx context.Context, namespace, name string) (*spritzv1.Spritz, error) {
@@ -814,6 +984,18 @@ func matchesIdempotentReplayTarget(spritz *spritzv1.Spritz, principal principal,
 }
 
 func summarizeCreateResponse(spritz *spritzv1.Spritz, principal principal, presetID, source, idempotencyKey string, replayed bool) createSpritzResponse {
+	annotations := spritz.GetAnnotations()
+	if principal.isService() {
+		if storedPresetID := strings.TrimSpace(annotations[presetIDAnnotationKey]); storedPresetID != "" {
+			presetID = storedPresetID
+		}
+		if storedSource := strings.TrimSpace(annotations[sourceAnnotationKey]); storedSource != "" {
+			source = storedSource
+		}
+		if storedIdempotencyKey := strings.TrimSpace(annotations[idempotencyKeyAnnotationKey]); storedIdempotencyKey != "" {
+			idempotencyKey = storedIdempotencyKey
+		}
+	}
 	createdAt := spritz.CreationTimestamp.DeepCopy()
 	idleExpiresAt, maxExpiresAt, expiresAt := lifecycleExpiryTimes(spritz, time.Now())
 	return createSpritzResponse{
@@ -844,6 +1026,16 @@ func lifecycleExpiryTimes(spritz *spritzv1.Spritz, _ time.Time) (*metav1.Time, *
 	return idleExpiresAt, maxExpiresAt, effectiveExpiresAt
 }
 
+func resolvePresetNamePrefix(explicit string, preset runtimePreset) string {
+	if prefix := sanitizeSpritzNameToken(explicit); prefix != "" {
+		return prefix
+	}
+	if prefix := sanitizeSpritzNameToken(preset.NamePrefix); prefix != "" {
+		return prefix
+	}
+	return deriveSpritzNamePrefixFromImage(preset.Image)
+}
+
 func (s *server) resolveSuggestNameMetadata(body suggestNameRequest) (suggestNameMetadata, error) {
 	metadata := suggestNameMetadata{
 		presetID: sanitizeSpritzNameToken(body.PresetID),
@@ -854,10 +1046,7 @@ func (s *server) resolveSuggestNameMetadata(body suggestNameRequest) (suggestNam
 			return suggestNameMetadata{}, fmt.Errorf("preset not found: %s", metadata.presetID)
 		}
 		metadata.image = preset.Image
-		metadata.namePrefix = resolveSpritzNamePrefix(body.NamePrefix, preset.NamePrefix)
-		if metadata.namePrefix == "" {
-			metadata.namePrefix = resolveSpritzNamePrefix("", preset.Image)
-		}
+		metadata.namePrefix = resolvePresetNamePrefix(body.NamePrefix, *preset)
 		return metadata, nil
 	}
 	metadata.image = strings.TrimSpace(body.Image)
