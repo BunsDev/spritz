@@ -499,6 +499,12 @@ func (in *SpritzStatus) DeepCopyInto(out *SpritzStatus) {
 	if in.LastActivityAt != nil {
 		out.LastActivityAt = in.LastActivityAt.DeepCopy()
 	}
+	if in.IdleExpiresAt != nil {
+		out.IdleExpiresAt = in.IdleExpiresAt.DeepCopy()
+	}
+	if in.MaxExpiresAt != nil {
+		out.MaxExpiresAt = in.MaxExpiresAt.DeepCopy()
+	}
 	if in.ExpiresAt != nil {
 		out.ExpiresAt = in.ExpiresAt.DeepCopy()
 	}

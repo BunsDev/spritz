@@ -71,10 +71,10 @@ func main() {
 	ns := os.Getenv("SPRITZ_NAMESPACE")
 	controlNamespace := strings.TrimSpace(os.Getenv("SPRITZ_CONTROL_NAMESPACE"))
 	if controlNamespace == "" {
-		controlNamespace = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		controlNamespace = strings.TrimSpace(ns)
 	}
 	if controlNamespace == "" {
-		controlNamespace = strings.TrimSpace(ns)
+		controlNamespace = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
 	}
 	if controlNamespace == "" {
 		controlNamespace = "default"

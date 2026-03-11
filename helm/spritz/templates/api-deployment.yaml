@@ -46,6 +46,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: SPRITZ_NAMESPACE
               value: {{ .Values.spritz.namespace | quote }}
+            - name: SPRITZ_CONTROL_NAMESPACE
+              value: {{ .Values.spritz.namespace | quote }}
             {{- if .Values.api.defaultAnnotations }}
             - name: SPRITZ_DEFAULT_ANNOTATIONS
               value: {{ .Values.api.defaultAnnotations | quote }}
