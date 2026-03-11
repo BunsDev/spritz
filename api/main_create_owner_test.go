@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -21,6 +22,9 @@ func newTestSpritzScheme(t *testing.T) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	if err := spritzv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("failed to register spritz scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to register core scheme: %v", err)
 	}
 	return scheme
 }
@@ -250,6 +254,31 @@ func TestCreateSpritzAllowsProvisionerToAssignOwnerOnce(t *testing.T) {
 	}
 }
 
+func TestCreateSpritzRejectsProvisionerWithoutOwnerID(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","idempotencyKey":"discord-missing-owner"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ownerId is required") {
+		t.Fatalf("expected ownerId validation error, got %s", rec.Body.String())
+	}
+}
+
 func TestCreateSpritzReplaysIdempotentProvisionerRequest(t *testing.T) {
 	s := newCreateSpritzTestServer(t)
 	configureProvisionerTestServer(s)
@@ -280,9 +309,18 @@ func TestCreateSpritzReplaysIdempotentProvisionerRequest(t *testing.T) {
 		t.Fatalf("expected replay status 200, got %d: %s", rec2.Code, rec2.Body.String())
 	}
 
+	var firstPayload map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatalf("failed to decode first response: %v", err)
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(rec2.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("failed to decode replay response: %v", err)
+	}
+	firstName := firstPayload["data"].(map[string]any)["spritz"].(map[string]any)["metadata"].(map[string]any)["name"]
+	replayedName := payload["data"].(map[string]any)["spritz"].(map[string]any)["metadata"].(map[string]any)["name"]
+	if firstName != replayedName {
+		t.Fatalf("expected idempotent replay to keep the same name, got first=%#v replay=%#v", firstName, replayedName)
 	}
 	data := payload["data"].(map[string]any)
 	if replayed, _ := data["replayed"].(bool); !replayed {
@@ -320,5 +358,37 @@ func TestCreateSpritzRejectsIdempotentProvisionerPayloadMismatch(t *testing.T) {
 	e.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusConflict {
 		t.Fatalf("expected conflict status 409, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestCreateSpritzReplaysIdempotentProvisionerRequestBeforeQuotaCheck(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	s.provisioners.maxActivePerOwner = 1
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-quota"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req1.Header.Set("X-Spritz-User-Id", "zenobot")
+	req1.Header.Set("X-Spritz-Principal-Type", "service")
+	req1.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected first create status 201, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req2.Header.Set("X-Spritz-User-Id", "zenobot")
+	req2.Header.Set("X-Spritz-Principal-Type", "service")
+	req2.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected replay status 200, got %d: %s", rec2.Code, rec2.Body.String())
 	}
 }

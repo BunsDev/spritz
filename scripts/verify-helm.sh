@@ -87,6 +87,7 @@ expect_contains "${default_render}" "name: SPRITZ_AUTH_HEADER_TYPE" "principal t
 expect_contains "${default_render}" "name: SPRITZ_AUTH_BEARER_SCOPES_PATHS" "bearer scope path wiring"
 expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_IDLE_TTL" "default provisioner idle ttl wiring"
 expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_TTL" "default provisioner ttl wiring"
+expect_contains "${default_render}" 'resources: ["configmaps"]' "configmap RBAC for idempotency reservations"
 
 expect_failure \
   "api.auth.mode must be header or auto when authGateway.enabled=true" \

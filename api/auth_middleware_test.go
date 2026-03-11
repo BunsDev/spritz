@@ -126,3 +126,55 @@ func TestAuthMiddlewareSetsPrincipalTypeAndScopes(t *testing.T) {
 		t.Fatalf("expected two scopes, got %#v", payload["scopes"])
 	}
 }
+
+func TestBearerAuthParsesSpaceDelimitedScopes(t *testing.T) {
+	introspection := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sub":   "zenobot",
+			"type":  "service",
+			"scope": "spritz.instances.create spritz.instances.assign_owner",
+		})
+	}))
+	defer introspection.Close()
+
+	t.Setenv("SPRITZ_AUTH_MODE", "bearer")
+	t.Setenv("SPRITZ_AUTH_BEARER_INTROSPECTION_URL", introspection.URL)
+	t.Setenv("SPRITZ_AUTH_BEARER_ID_PATHS", "sub")
+	t.Setenv("SPRITZ_AUTH_BEARER_TYPE_PATHS", "type")
+	t.Setenv("SPRITZ_AUTH_BEARER_SCOPES_PATHS", "scope")
+
+	s := &server{auth: newAuthConfig()}
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.GET("/api/spritzes", func(c echo.Context) error {
+		p, ok := principalFromContext(c)
+		if !ok {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "missing principal"})
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"type":   p.Type,
+			"scopes": p.Scopes,
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/spritzes", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	payload := map[string]any{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if payload["type"] != string(principalTypeService) {
+		t.Fatalf("expected service principal type, got %#v", payload["type"])
+	}
+	scopes, _ := payload["scopes"].([]any)
+	if len(scopes) != 2 {
+		t.Fatalf("expected two scopes, got %#v", payload["scopes"])
+	}
+}

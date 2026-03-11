@@ -219,7 +219,7 @@
   }
 
   function sanitizeHydratedMessage(message) {
-    const type = message?.type || 'system';
+    const type = message?.type || message?.kind || 'system';
     const hadHtmlError = Array.isArray(message?.blocks)
       ? message.blocks.some((block) => {
           if (!block || typeof block !== 'object') return false;

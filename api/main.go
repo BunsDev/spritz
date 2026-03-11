@@ -379,47 +379,13 @@ func (s *server) createSpritz(c echo.Context) error {
 	}
 	body.Spec.Owner = owner
 
-	if principal.isService() {
-		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace)
-		if err != nil {
-			if errors.Is(err, errForbidden) {
-				return writeError(c, http.StatusForbidden, "forbidden")
-			}
-			return writeError(c, http.StatusBadRequest, err.Error())
-		}
-		existing, err := findIdempotentSpritz(c.Request().Context(), s.client, namespace, principal.ID, body.IdempotencyKey)
-		if err != nil {
-			return writeError(c, http.StatusInternalServerError, err.Error())
-		}
-		if existing != nil {
-			if strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) != fingerprint {
-				return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
-			}
-			return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
-		}
-		body.Annotations = mergeStringMap(body.Annotations, map[string]string{
-			actorIDAnnotationKey:        principal.ID,
-			actorTypeAnnotationKey:      string(principal.Type),
-			sourceAnnotationKey:         provisionerSource(&body),
-			requestIDAnnotationKey:      body.RequestID,
-			idempotencyKeyAnnotationKey: body.IdempotencyKey,
-			idempotencyHashAnnotationKey: fingerprint,
-		})
-	} else if s.auth.enabled() && !principal.isAdminPrincipal() && owner.ID != principal.ID {
-		return writeError(c, http.StatusForbidden, "owner mismatch")
-	}
-
-	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, principal.isService()); err != nil {
-		return writeError(c, http.StatusBadRequest, err.Error())
-	}
-
 	nameProvided := body.Name != ""
 	var nameGenerator func() string
+	namePrefix := resolveSpritzNamePrefix(body.NamePrefix, body.Spec.Image)
+	if namePrefix == "" && preset != nil {
+		namePrefix = resolveSpritzNamePrefix(preset.NamePrefix, preset.Image)
+	}
 	if !nameProvided {
-		namePrefix := resolveSpritzNamePrefix(body.NamePrefix, body.Spec.Image)
-		if namePrefix == "" && preset != nil {
-			namePrefix = resolveSpritzNamePrefix(preset.NamePrefix, preset.Image)
-		}
 		generator, err := s.newSpritzNameGenerator(c.Request().Context(), namespace, namePrefix)
 		if err != nil {
 			return writeError(c, http.StatusInternalServerError, "failed to generate spritz name")
@@ -429,6 +395,58 @@ func (s *server) createSpritz(c echo.Context) error {
 	}
 	if body.Name == "" {
 		return writeError(c, http.StatusInternalServerError, "failed to generate spritz name")
+	}
+
+	if principal.isService() {
+		fingerprintName := body.Name
+		if !nameProvided {
+			fingerprintName = ""
+		}
+		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
+		if err != nil {
+			if errors.Is(err, errForbidden) {
+				return writeError(c, http.StatusForbidden, "forbidden")
+			}
+			return writeError(c, http.StatusBadRequest, err.Error())
+		}
+		reservedName, completed, err := s.reserveIdempotentCreateName(c.Request().Context(), namespace, principal, body.IdempotencyKey, fingerprint, body.Name)
+		if err != nil {
+			if strings.Contains(err.Error(), "idempotencyKey already used") {
+				return writeError(c, http.StatusConflict, err.Error())
+			}
+			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		body.Name = reservedName
+		existing, err := s.findReservedSpritz(c.Request().Context(), namespace, reservedName)
+		if err != nil {
+			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		if existing != nil {
+			if strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) != fingerprint {
+				return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
+			}
+			return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
+		}
+		if completed {
+			return writeError(c, http.StatusConflict, "idempotencyKey already used")
+		}
+		if err := s.enforceProvisionerQuotas(c.Request().Context(), namespace, principal, body.Spec.Owner.ID); err != nil {
+			return writeError(c, http.StatusBadRequest, err.Error())
+		}
+		body.Annotations = mergeStringMap(body.Annotations, map[string]string{
+			actorIDAnnotationKey:         principal.ID,
+			actorTypeAnnotationKey:       string(principal.Type),
+			sourceAnnotationKey:          provisionerSource(&body),
+			requestIDAnnotationKey:       body.RequestID,
+			idempotencyKeyAnnotationKey:  body.IdempotencyKey,
+			idempotencyHashAnnotationKey: fingerprint,
+		})
+	} else if s.auth.enabled() && !principal.isAdminPrincipal() && owner.ID != principal.ID {
+		return writeError(c, http.StatusForbidden, "owner mismatch")
+	}
+
+	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, principal.isService()); err != nil {
+		return writeError(c, http.StatusBadRequest, err.Error())
 	}
 
 	labels := map[string]string{
@@ -508,10 +526,25 @@ func (s *server) createSpritz(c echo.Context) error {
 			return writeError(c, http.StatusBadRequest, err.Error())
 		}
 		if err := s.client.Create(c.Request().Context(), spritz); err != nil {
+			if principal.isService() && apierrors.IsAlreadyExists(err) {
+				existing, getErr := s.findReservedSpritz(c.Request().Context(), namespace, name)
+				if getErr != nil {
+					return writeError(c, http.StatusInternalServerError, getErr.Error())
+				}
+				if existing != nil && strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) == strings.TrimSpace(annotations[idempotencyHashAnnotationKey]) {
+					return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
+				}
+				return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
+			}
 			if !nameProvided && apierrors.IsAlreadyExists(err) {
 				continue
 			}
 			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		if principal.isService() {
+			if err := s.completeIdempotencyReservation(c.Request().Context(), namespace, principal.ID, body.IdempotencyKey, spritz); err != nil {
+				return writeError(c, http.StatusInternalServerError, err.Error())
+			}
 		}
 		return writeJSON(c, http.StatusCreated, summarizeCreateResponse(spritz, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, false))
 	}

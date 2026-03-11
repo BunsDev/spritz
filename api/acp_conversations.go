@@ -48,7 +48,7 @@ func (s *server) listACPConversations(c echo.Context) error {
 	if spritzName != "" {
 		labels[acpConversationSpritzLabelKey] = spritzName
 	}
-	if s.auth.enabled() {
+	if s.auth.enabled() && !principal.isAdminPrincipal() {
 		labels[acpConversationOwnerLabelKey] = ownerLabelValue(principal.ID)
 	}
 	opts = append(opts, client.MatchingLabels(labels))

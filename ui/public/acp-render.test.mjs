@@ -232,3 +232,28 @@ test('ACP render adapter coalesces bootstrap replay chunks for the same historic
   assert.equal(transcript.messages.length, 1);
   assert.equal(transcript.messages[0].blocks[0].text, 'Earlier assistant message');
 });
+
+test('ACP render adapter hydrates legacy cached messages that used kind', () => {
+  const ACPRender = loadRenderModule();
+  const transcript = ACPRender.hydrateTranscript({
+    messages: [
+      {
+        id: 'legacy-user',
+        kind: 'user',
+        blocks: [{ type: 'text', text: 'Legacy user message' }],
+        toolCallId: '',
+      },
+      {
+        id: 'legacy-tool',
+        kind: 'tool',
+        blocks: [{ type: 'details', title: 'Result', text: 'done', open: true }],
+        toolCallId: 'tool-legacy',
+      },
+    ],
+  });
+
+  assert.equal(transcript.messages.length, 2);
+  assert.equal(transcript.messages[0].type, 'user');
+  assert.equal(transcript.messages[1].type, 'tool');
+  assert.equal(transcript.toolCallIndex.get('tool-legacy'), 1);
+});

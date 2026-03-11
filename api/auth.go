@@ -231,7 +231,7 @@ func (a *authConfig) principal(r *http.Request) (principal, error) {
 			id,
 			"",
 			normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
-			splitList(r.Header.Get(a.headerScopes)),
+			splitScopes(r.Header.Get(a.headerScopes)),
 			a.isAdmin(id, teams),
 		), nil
 	case authModeAuto:
@@ -246,7 +246,7 @@ func (a *authConfig) principal(r *http.Request) (principal, error) {
 				id,
 				"",
 				normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
-				splitList(r.Header.Get(a.headerScopes)),
+				splitScopes(r.Header.Get(a.headerScopes)),
 				a.isAdmin(id, teams),
 			), nil
 		}
@@ -348,7 +348,7 @@ func (a *authConfig) introspectToken(ctx context.Context, token string) (princip
 		firstStringPath(payload, []string{"sub"}),
 		firstStringPath(payload, []string{"iss", "issuer"}),
 		normalizePrincipalType(firstStringPath(payload, a.bearerTypePaths), a.bearerDefaultType),
-		firstStringListPath(payload, a.bearerScopesPaths),
+		firstScopeListPath(payload, a.bearerScopesPaths),
 		a.isAdmin(id, teams),
 	), nil
 }
@@ -434,7 +434,7 @@ func (a *authConfig) principalFromJWT(ctx context.Context, token string) (princi
 		firstStringPath(claims, []string{"sub"}),
 		firstStringPath(claims, []string{"iss", "issuer"}),
 		normalizePrincipalType(firstStringPath(claims, a.bearerTypePaths), a.bearerDefaultType),
-		firstStringListPath(claims, a.bearerScopesPaths),
+		firstScopeListPath(claims, a.bearerScopesPaths),
 		a.isAdmin(id, teams),
 	), nil
 }
@@ -602,6 +602,23 @@ func splitList(value string) []string {
 	return out
 }
 
+func splitScopes(value string) []string {
+	if value == "" {
+		return nil
+	}
+	raw := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
+	})
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func splitListOrDefault(value string, fallback []string) []string {
 	items := splitList(value)
 	if len(items) == 0 {
@@ -719,6 +736,32 @@ func firstStringListPath(payload map[string]any, paths []string) []string {
 			}
 		case string:
 			return splitList(typed)
+		}
+	}
+	return nil
+}
+
+func firstScopeListPath(payload map[string]any, paths []string) []string {
+	for _, path := range paths {
+		value, ok := lookupPath(payload, path)
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case []string:
+			return typed
+		case []any:
+			items := make([]string, 0, len(typed))
+			for _, item := range typed {
+				if s, ok := item.(string); ok && s != "" {
+					items = append(items, s)
+				}
+			}
+			if len(items) > 0 {
+				return items
+			}
+		case string:
+			return splitScopes(typed)
 		}
 	}
 	return nil

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -33,6 +34,10 @@ const (
 	actorLabelKey                 = "spritz.sh/actor"
 	idempotencyLabelKey           = "spritz.sh/idempotency"
 	presetLabelKey                = "spritz.sh/preset"
+	idempotencyReservationPrefix  = "spritz-idempotency-"
+	idempotencyReservationHashKey = "fingerprint"
+	idempotencyReservationNameKey = "spritzName"
+	idempotencyReservationDoneKey = "completed"
 	defaultProvisionerSource      = "external"
 	defaultProvisionerIdleTTL     = 24 * time.Hour
 	defaultProvisionerMaxTTL      = 7 * 24 * time.Hour
@@ -56,20 +61,20 @@ type presetCatalog struct {
 }
 
 type provisionerPolicy struct {
-	allowedPresetIDs      map[string]struct{}
-	defaultPresetID       string
-	allowCustomImage      bool
-	allowCustomRepo       bool
+	allowedPresetIDs       map[string]struct{}
+	defaultPresetID        string
+	allowCustomImage       bool
+	allowCustomRepo        bool
 	allowNamespaceOverride bool
-	allowedNamespaces     map[string]struct{}
-	defaultIdleTTL        time.Duration
-	maxIdleTTL            time.Duration
-	defaultTTL            time.Duration
-	maxTTL                time.Duration
-	maxActivePerOwner     int
-	maxCreatesPerActor    int
-	maxCreatesPerOwner    int
-	rateWindow            time.Duration
+	allowedNamespaces      map[string]struct{}
+	defaultIdleTTL         time.Duration
+	maxIdleTTL             time.Duration
+	defaultTTL             time.Duration
+	maxTTL                 time.Duration
+	maxActivePerOwner      int
+	maxCreatesPerActor     int
+	maxCreatesPerOwner     int
+	rateWindow             time.Duration
 }
 
 type createSpritzResponse struct {
@@ -130,6 +135,9 @@ func applyTopLevelCreateFields(body *createRequest) {
 
 func normalizeCreateOwner(body *createRequest, principal principal, authEnabled bool) (spritzv1.SpritzOwner, error) {
 	owner := body.Spec.Owner
+	if principal.isService() && strings.TrimSpace(body.OwnerID) == "" && strings.TrimSpace(owner.ID) == "" {
+		return owner, fmt.Errorf("ownerId is required")
+	}
 	if owner.ID == "" {
 		if authEnabled {
 			owner.ID = principal.ID
@@ -174,7 +182,7 @@ func (p provisionerPolicy) validatePreset(presetID string) error {
 	return fmt.Errorf("preset is not allowed: %s", presetID)
 }
 
-func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool) (string, error) {
+func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
 	if !principalCanUseProvisionerFlow(principal) {
 		return "", errForbidden
 	}
@@ -183,9 +191,6 @@ func (s *server) validateProvisionerCreate(ctx context.Context, principal princi
 	}
 	if err := authorizeServiceAction(principal, scopeInstancesAssignOwner, true); err != nil {
 		return "", err
-	}
-	if strings.TrimSpace(body.Spec.Owner.ID) == "" {
-		return "", fmt.Errorf("ownerId is required")
 	}
 	if requestedNamespace && !s.provisioners.allowNamespaceOverride {
 		return "", fmt.Errorf("namespace override is not allowed")
@@ -216,10 +221,7 @@ func (s *server) validateProvisionerCreate(ctx context.Context, principal princi
 	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, true); err != nil {
 		return "", err
 	}
-	if err := s.enforceProvisionerQuotas(ctx, namespace, principal, body.Spec.Owner.ID); err != nil {
-		return "", err
-	}
-	return createFingerprint(body.Spec.Owner.ID, body.PresetID, body.Name, namespace, provisionerSource(body), body.Spec, userConfig)
+	return createFingerprint(body.Spec.Owner.ID, body.PresetID, nameForFingerprint, namespace, provisionerSource(body), body.Spec, userConfig)
 }
 
 func (s *server) enforceProvisionerQuotas(ctx context.Context, namespace string, principal principal, ownerID string) error {
@@ -474,26 +476,84 @@ func createFingerprint(ownerID, presetID, name, namespace, source string, spec s
 	return fmt.Sprintf("%x", sum[:]), nil
 }
 
-func findIdempotentSpritz(ctx context.Context, k8sClient client.Client, namespace, actorID, idempotencyKey string) (*spritzv1.Spritz, error) {
-	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(idempotencyKey) == "" {
+func idempotencyReservationName(actorID, key string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(actorID) + ":" + strings.TrimSpace(key)))
+	return fmt.Sprintf("%s%x", idempotencyReservationPrefix, sum[:16])
+}
+
+func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace string, principal principal, key, fingerprint, desiredName string) (string, bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return desiredName, false, nil
+	}
+	reservationName := idempotencyReservationName(principal.ID, key)
+	record := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      reservationName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				actorLabelKey:       actorLabelValue(principal.ID),
+				idempotencyLabelKey: idempotencyLabelValue(key),
+			},
+		},
+		Data: map[string]string{
+			idempotencyReservationHashKey: fingerprint,
+			idempotencyReservationNameKey: desiredName,
+			idempotencyReservationDoneKey: "false",
+		},
+	}
+	if err := s.client.Create(ctx, record); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return "", false, err
+		}
+		existing := &corev1.ConfigMap{}
+		if getErr := s.client.Get(ctx, clientKey(namespace, reservationName), existing); getErr != nil {
+			return "", false, getErr
+		}
+		if strings.TrimSpace(existing.Data[idempotencyReservationHashKey]) != fingerprint {
+			return "", false, fmt.Errorf("idempotencyKey already used with a different request")
+		}
+		name := strings.TrimSpace(existing.Data[idempotencyReservationNameKey])
+		if name == "" {
+			name = desiredName
+		}
+		done := strings.EqualFold(strings.TrimSpace(existing.Data[idempotencyReservationDoneKey]), "true")
+		return name, done, nil
+	}
+	return desiredName, false, nil
+}
+
+func (s *server) completeIdempotencyReservation(ctx context.Context, namespace, actorID, key string, spritz *spritzv1.Spritz) error {
+	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(key) == "" || spritz == nil {
+		return nil
+	}
+	reservationName := idempotencyReservationName(actorID, key)
+	current := &corev1.ConfigMap{}
+	if err := s.client.Get(ctx, clientKey(namespace, reservationName), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if current.Data == nil {
+		current.Data = map[string]string{}
+	}
+	current.Data[idempotencyReservationNameKey] = spritz.Name
+	current.Data[idempotencyReservationDoneKey] = "true"
+	return s.client.Update(ctx, current)
+}
+
+func (s *server) findReservedSpritz(ctx context.Context, namespace, name string) (*spritzv1.Spritz, error) {
+	if strings.TrimSpace(name) == "" {
 		return nil, nil
 	}
-	list := &spritzv1.SpritzList{}
-	opts := []client.ListOption{
-		client.InNamespace(namespace),
-		client.MatchingLabels(map[string]string{
-			actorLabelKey:       actorLabelValue(actorID),
-			idempotencyLabelKey: idempotencyLabelValue(idempotencyKey),
-		}),
-	}
-	if err := k8sClient.List(ctx, list, opts...); err != nil {
+	spritz := &spritzv1.Spritz{}
+	if err := s.client.Get(ctx, clientKey(namespace, name), spritz); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	if len(list.Items) == 0 {
-		return nil, nil
-	}
-	item := list.Items[0].DeepCopy()
-	return item, nil
+	return spritz, nil
 }
 
 func summarizeCreateResponse(spritz *spritzv1.Spritz, principal principal, presetID, source, idempotencyKey string, replayed bool) createSpritzResponse {

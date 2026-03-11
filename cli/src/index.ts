@@ -567,6 +567,17 @@ async function authHeaders(): Promise<Record<string, string>> {
   return headers;
 }
 
+async function resolveDefaultOwnerId(): Promise<string | undefined> {
+  const { profile } = await resolveProfile({ allowFlag: true });
+  return (
+    process.env.SPRITZ_OWNER_ID ||
+    process.env.SPRITZ_USER_ID ||
+    profile?.userId ||
+    process.env.USER ||
+    undefined
+  );
+}
+
 async function request(path: string, init?: RequestInit) {
   const controller = new AbortController();
   const timeoutMs = Number.isFinite(requestTimeoutMs) ? requestTimeoutMs : 10000;
@@ -1069,7 +1080,8 @@ async function main() {
 
     const repo = argValue('--repo');
     const branch = argValue('--branch');
-    const ownerId = argValue('--owner-id') || process.env.SPRITZ_OWNER_ID;
+    const token = argValue('--token') || process.env.SPRITZ_BEARER_TOKEN;
+    const ownerId = argValue('--owner-id') || (token?.trim() ? process.env.SPRITZ_OWNER_ID : await resolveDefaultOwnerId());
     const idleTtl = argValue('--idle-ttl');
     const ttl = argValue('--ttl');
     const idempotencyKey = argValue('--idempotency-key');
