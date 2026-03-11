@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -15,6 +18,9 @@ func (s *server) openACPConversationConnection(c echo.Context) error {
 	principal, ok := principalFromContext(c)
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
+	}
+	if err := authorizeHumanOnly(principal, s.auth.enabled()); err != nil {
+		return writeForbidden(c)
 	}
 	namespace := s.requestNamespace(c)
 	conversation, err := s.getAuthorizedConversation(c.Request().Context(), principal, namespace, c.Param("id"))
@@ -47,10 +53,22 @@ func (s *server) openACPConversationConnection(c echo.Context) error {
 		_ = workspaceConn.Close()
 	}()
 
-	return proxyWebSockets(browserConn, workspaceConn)
+	return proxyWebSockets(
+		browserConn,
+		workspaceConn,
+		func(payload []byte) {
+			if !isACPPromptMessage(payload) {
+				return
+			}
+			if err := s.markSpritzActivity(c.Request().Context(), spritz.Namespace, spritz.Name, time.Now()); err != nil {
+				c.Logger().Warnf("failed to record acp activity for %s/%s: %v", spritz.Namespace, spritz.Name, err)
+			}
+		},
+		nil,
+	)
 }
 
-func proxyWebSockets(left, right *websocket.Conn) error {
+func proxyWebSockets(left, right *websocket.Conn, onLeftMessage, onRightMessage func([]byte)) error {
 	errCh := make(chan error, 2)
 	closeOnce := sync.Once{}
 	closeBoth := func() {
@@ -58,8 +76,8 @@ func proxyWebSockets(left, right *websocket.Conn) error {
 		_ = right.Close()
 	}
 
-	go proxyWebSocketDirection(left, right, errCh)
-	go proxyWebSocketDirection(right, left, errCh)
+	go proxyWebSocketDirection(left, right, errCh, onLeftMessage)
+	go proxyWebSocketDirection(right, left, errCh, onRightMessage)
 
 	err := <-errCh
 	closeOnce.Do(closeBoth)
@@ -69,16 +87,29 @@ func proxyWebSockets(left, right *websocket.Conn) error {
 	return err
 }
 
-func proxyWebSocketDirection(src, dst *websocket.Conn, errCh chan<- error) {
+func proxyWebSocketDirection(src, dst *websocket.Conn, errCh chan<- error, onMessage func([]byte)) {
 	for {
 		msgType, payload, err := src.ReadMessage()
 		if err != nil {
 			errCh <- err
 			return
 		}
+		if onMessage != nil {
+			onMessage(payload)
+		}
 		if err := dst.WriteMessage(msgType, payload); err != nil {
 			errCh <- err
 			return
 		}
 	}
+}
+
+func isACPPromptMessage(payload []byte) bool {
+	var message struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return false
+	}
+	return strings.TrimSpace(message.Method) == "session/prompt"
 }

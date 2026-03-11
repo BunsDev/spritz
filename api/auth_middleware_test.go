@@ -80,3 +80,49 @@ func TestAuthMiddlewareSetsPrincipal(t *testing.T) {
 		t.Fatalf("expected email to be user@example.com, got %q", payload["email"])
 	}
 }
+
+func TestAuthMiddlewareSetsPrincipalTypeAndScopes(t *testing.T) {
+	t.Setenv("SPRITZ_AUTH_MODE", "header")
+	t.Setenv("SPRITZ_AUTH_HEADER_ID", "X-Spritz-User-Id")
+	t.Setenv("SPRITZ_AUTH_HEADER_TYPE", "X-Spritz-Principal-Type")
+	t.Setenv("SPRITZ_AUTH_HEADER_SCOPES", "X-Spritz-Principal-Scopes")
+
+	s := &server{auth: newAuthConfig()}
+	e := echo.New()
+
+	secured := e.Group("", s.authMiddleware())
+	secured.GET("/api/spritzes", func(c echo.Context) error {
+		p, ok := principalFromContext(c)
+		if !ok {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "missing principal"})
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"id":     p.ID,
+			"type":   p.Type,
+			"scopes": p.Scopes,
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/spritzes", nil)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	payload := map[string]any{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if payload["type"] != string(principalTypeService) {
+		t.Fatalf("expected service principal type, got %#v", payload["type"])
+	}
+	scopes, _ := payload["scopes"].([]any)
+	if len(scopes) != 2 {
+		t.Fatalf("expected two scopes, got %#v", payload["scopes"])
+	}
+}

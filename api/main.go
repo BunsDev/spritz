@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,8 @@ type server struct {
 	sshDefaults       sshDefaults
 	sshMintLimiter    *sshMintLimiter
 	acp               acpConfig
+	presets           presetCatalog
+	provisioners      provisionerPolicy
 	defaultMetadata   map[string]string
 	sharedMounts      sharedMountsConfig
 	sharedMountsStore *sharedMountsStore
@@ -80,6 +83,12 @@ func main() {
 	ingressDefaults := newIngressDefaults()
 	terminal := newTerminalConfig()
 	acp := newACPConfig()
+	presets, err := newPresetCatalog()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid preset config: %v\n", err)
+		os.Exit(1)
+	}
+	provisioners := newProvisionerPolicy()
 	sshDefaults := newSSHDefaults()
 	sshGateway, err := newSSHGatewayConfig()
 	if err != nil {
@@ -126,6 +135,8 @@ func main() {
 		sshDefaults:       sshDefaults,
 		sshMintLimiter:    sshMintLimiter,
 		acp:               acp,
+		presets:           presets,
+		provisioners:      provisioners,
 		defaultMetadata:   defaultAnnotations,
 		sharedMounts:      sharedMounts,
 		sharedMountsStore: sharedStore,
@@ -189,6 +200,7 @@ func (s *server) registerRoutes(e *echo.Echo) {
 	internal.PUT("/shared-mounts/owner/:owner/:mount/revisions/:revision", s.putSharedMountRevision)
 	internal.PUT("/shared-mounts/owner/:owner/:mount/latest", s.putSharedMountLatest)
 	secured := group.Group("", s.authMiddleware())
+	secured.GET("/presets", s.listPresets)
 	secured.GET("/spritzes", s.listSpritzes)
 	secured.POST("/spritzes/suggest-name", s.suggestSpritzName)
 	secured.POST("/spritzes", s.createSpritz)
@@ -214,18 +226,26 @@ func (s *server) handleHealthz(c echo.Context) error {
 }
 
 type createRequest struct {
-	Name        string              `json:"name"`
-	NamePrefix  string              `json:"namePrefix,omitempty"`
-	Namespace   string              `json:"namespace,omitempty"`
-	Spec        spritzv1.SpritzSpec `json:"spec"`
-	UserConfig  json.RawMessage     `json:"userConfig,omitempty"`
-	Labels      map[string]string   `json:"labels,omitempty"`
-	Annotations map[string]string   `json:"annotations,omitempty"`
+	Name           string              `json:"name"`
+	NamePrefix     string              `json:"namePrefix,omitempty"`
+	Namespace      string              `json:"namespace,omitempty"`
+	PresetID       string              `json:"presetId,omitempty"`
+	OwnerID        string              `json:"ownerId,omitempty"`
+	IdleTTL        string              `json:"idleTtl,omitempty"`
+	TTL            string              `json:"ttl,omitempty"`
+	IdempotencyKey string              `json:"idempotencyKey,omitempty"`
+	Source         string              `json:"source,omitempty"`
+	RequestID      string              `json:"requestId,omitempty"`
+	Spec           spritzv1.SpritzSpec `json:"spec"`
+	UserConfig     json.RawMessage     `json:"userConfig,omitempty"`
+	Labels         map[string]string   `json:"labels,omitempty"`
+	Annotations    map[string]string   `json:"annotations,omitempty"`
 }
 
 type suggestNameRequest struct {
 	Namespace  string `json:"namespace,omitempty"`
 	Image      string `json:"image,omitempty"`
+	PresetID   string `json:"presetId,omitempty"`
 	NamePrefix string `json:"namePrefix,omitempty"`
 }
 
@@ -243,27 +263,40 @@ func (s *server) resolveSpritzNamespace(requested string) (string, error) {
 	return namespace, nil
 }
 
+func (s *server) listPresets(c echo.Context) error {
+	principal, ok := principalFromContext(c)
+	if s.auth.enabled() && (!ok || principal.ID == "") {
+		return writeError(c, http.StatusUnauthorized, "unauthenticated")
+	}
+	if principal.isService() && !principal.hasScope(scopePresetsRead) && !principal.isAdminPrincipal() {
+		return writeError(c, http.StatusForbidden, "forbidden")
+	}
+	return writeJSON(c, http.StatusOK, map[string]any{"items": s.presets.all()})
+}
+
 func (s *server) suggestSpritzName(c echo.Context) error {
 	principal, ok := principalFromContext(c)
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
+	}
+	if principal.isService() && !principal.hasScope(scopeInstancesSuggestName) && !principal.isAdminPrincipal() {
+		return writeError(c, http.StatusForbidden, "forbidden")
 	}
 
 	var body suggestNameRequest
 	if err := c.Bind(&body); err != nil {
 		return writeError(c, http.StatusBadRequest, "invalid json")
 	}
-	body.Image = strings.TrimSpace(body.Image)
-	if body.Image == "" {
-		return writeError(c, http.StatusBadRequest, "image is required")
+	metadata, err := s.resolveSuggestNameMetadata(body)
+	if err != nil {
+		return writeError(c, http.StatusBadRequest, err.Error())
 	}
 
 	namespace, err := s.resolveSpritzNamespace(body.Namespace)
 	if err != nil {
 		return writeError(c, http.StatusForbidden, err.Error())
 	}
-	namePrefix := resolveSpritzNamePrefix(body.NamePrefix, body.Image)
-	generator, err := s.newSpritzNameGenerator(c.Request().Context(), namespace, namePrefix)
+	generator, err := s.newSpritzNameGenerator(c.Request().Context(), namespace, metadata.namePrefix)
 	if err != nil {
 		return writeError(c, http.StatusInternalServerError, "failed to generate spritz name")
 	}
@@ -281,17 +314,33 @@ func (s *server) createSpritz(c echo.Context) error {
 		return writeError(c, http.StatusBadRequest, "invalid json")
 	}
 	body.Name = strings.TrimSpace(body.Name)
+	body.NamePrefix = strings.TrimSpace(body.NamePrefix)
+	applyTopLevelCreateFields(&body)
+
+	requestedNamespace := strings.TrimSpace(body.Namespace) != ""
+	requestedImage := strings.TrimSpace(body.Spec.Image) != ""
+	requestedRepo := body.Spec.Repo != nil || len(body.Spec.Repos) > 0
+	preset, err := s.applyCreatePreset(&body)
+	if err != nil {
+		return writeError(c, http.StatusBadRequest, err.Error())
+	}
 
 	userConfigKeys, userConfigPayload, err := parseUserConfig(body.UserConfig)
 	if err != nil {
 		return writeError(c, http.StatusBadRequest, err.Error())
 	}
+	var normalizedUserConfig json.RawMessage
 	if len(userConfigKeys) > 0 {
 		normalized, err := normalizeUserConfig(s.userConfigPolicy, userConfigKeys, userConfigPayload)
 		if err != nil {
 			return writeError(c, http.StatusBadRequest, err.Error())
 		}
 		userConfigPayload = normalized
+		encodedUserConfig, err := json.Marshal(userConfigPayload)
+		if err != nil {
+			return writeError(c, http.StatusBadRequest, "invalid userConfig")
+		}
+		normalizedUserConfig = encodedUserConfig
 		applyUserConfig(&body.Spec, userConfigKeys, userConfigPayload)
 	}
 
@@ -324,10 +373,53 @@ func (s *server) createSpritz(c echo.Context) error {
 		return writeError(c, http.StatusForbidden, err.Error())
 	}
 
+	owner, err := normalizeCreateOwner(&body, principal, s.auth.enabled())
+	if err != nil {
+		return writeError(c, http.StatusBadRequest, err.Error())
+	}
+	body.Spec.Owner = owner
+
+	if principal.isService() {
+		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace)
+		if err != nil {
+			if errors.Is(err, errForbidden) {
+				return writeError(c, http.StatusForbidden, "forbidden")
+			}
+			return writeError(c, http.StatusBadRequest, err.Error())
+		}
+		existing, err := findIdempotentSpritz(c.Request().Context(), s.client, namespace, principal.ID, body.IdempotencyKey)
+		if err != nil {
+			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		if existing != nil {
+			if strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) != fingerprint {
+				return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
+			}
+			return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
+		}
+		body.Annotations = mergeStringMap(body.Annotations, map[string]string{
+			actorIDAnnotationKey:        principal.ID,
+			actorTypeAnnotationKey:      string(principal.Type),
+			sourceAnnotationKey:         provisionerSource(&body),
+			requestIDAnnotationKey:      body.RequestID,
+			idempotencyKeyAnnotationKey: body.IdempotencyKey,
+			idempotencyHashAnnotationKey: fingerprint,
+		})
+	} else if s.auth.enabled() && !principal.isAdminPrincipal() && owner.ID != principal.ID {
+		return writeError(c, http.StatusForbidden, "owner mismatch")
+	}
+
+	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, principal.isService()); err != nil {
+		return writeError(c, http.StatusBadRequest, err.Error())
+	}
+
 	nameProvided := body.Name != ""
 	var nameGenerator func() string
 	if !nameProvided {
 		namePrefix := resolveSpritzNamePrefix(body.NamePrefix, body.Spec.Image)
+		if namePrefix == "" && preset != nil {
+			namePrefix = resolveSpritzNamePrefix(preset.NamePrefix, preset.Image)
+		}
 		generator, err := s.newSpritzNameGenerator(c.Request().Context(), namespace, namePrefix)
 		if err != nil {
 			return writeError(c, http.StatusInternalServerError, "failed to generate spritz name")
@@ -339,20 +431,15 @@ func (s *server) createSpritz(c echo.Context) error {
 		return writeError(c, http.StatusInternalServerError, "failed to generate spritz name")
 	}
 
-	owner := body.Spec.Owner
-	if owner.ID == "" {
-		if s.auth.enabled() {
-			owner.ID = principal.ID
-		} else {
-			return writeError(c, http.StatusBadRequest, "spec.owner.id is required")
-		}
-	}
-	if s.auth.enabled() && !principal.IsAdmin && owner.ID != principal.ID {
-		return writeError(c, http.StatusForbidden, "owner mismatch")
-	}
-
 	labels := map[string]string{
 		ownerLabelKey: ownerLabelValue(owner.ID),
+	}
+	if principal.isService() {
+		labels[actorLabelKey] = actorLabelValue(principal.ID)
+		labels[idempotencyLabelKey] = idempotencyLabelValue(body.IdempotencyKey)
+	}
+	if body.PresetID != "" {
+		labels[presetLabelKey] = body.PresetID
 	}
 	for k, v := range body.Labels {
 		labels[k] = v
@@ -369,8 +456,12 @@ func (s *server) createSpritz(c echo.Context) error {
 			})
 		}
 	}
+	if body.PresetID != "" {
+		annotations = mergeStringMap(annotations, map[string]string{
+			presetIDAnnotationKey: body.PresetID,
+		})
+	}
 
-	body.Spec.Owner = owner
 	applySSHDefaults(&body.Spec, s.sshDefaults, namespace)
 	baseSpec := body.Spec
 
@@ -422,7 +513,7 @@ func (s *server) createSpritz(c echo.Context) error {
 			}
 			return writeError(c, http.StatusInternalServerError, err.Error())
 		}
-		return writeJSON(c, http.StatusCreated, spritz)
+		return writeJSON(c, http.StatusCreated, summarizeCreateResponse(spritz, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, false))
 	}
 
 	return writeError(c, http.StatusInternalServerError, "failed to generate unique spritz name")
@@ -432,6 +523,9 @@ func (s *server) listSpritzes(c echo.Context) error {
 	principal, ok := principalFromContext(c)
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
+	}
+	if err := authorizeHumanOnly(principal, s.auth.enabled()); err != nil {
+		return writeForbidden(c)
 	}
 
 	namespace := s.namespace
@@ -449,10 +543,10 @@ func (s *server) listSpritzes(c echo.Context) error {
 		return writeError(c, http.StatusInternalServerError, err.Error())
 	}
 
-	if s.auth.enabled() && !principal.IsAdmin {
+	if s.auth.enabled() {
 		filtered := make([]spritzv1.Spritz, 0, len(list.Items))
 		for _, item := range list.Items {
-			if item.Spec.Owner.ID == principal.ID {
+			if err := authorizeHumanOwnedAccess(principal, item.Spec.Owner.ID, true); err == nil {
 				filtered = append(filtered, item)
 			}
 		}
@@ -471,6 +565,9 @@ func (s *server) getSpritz(c echo.Context) error {
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
 	}
+	if err := authorizeHumanOnly(principal, s.auth.enabled()); err != nil {
+		return writeForbidden(c)
+	}
 
 	namespace := s.namespace
 	if namespace == "" {
@@ -484,7 +581,7 @@ func (s *server) getSpritz(c echo.Context) error {
 	if err := s.client.Get(c.Request().Context(), client.ObjectKey{Name: name, Namespace: namespace}, spritz); err != nil {
 		return writeError(c, http.StatusNotFound, err.Error())
 	}
-	if s.auth.enabled() && !principal.IsAdmin && spritz.Spec.Owner.ID != principal.ID {
+	if err := authorizeHumanOwnedAccess(principal, spritz.Spec.Owner.ID, s.auth.enabled()); err != nil {
 		return writeError(c, http.StatusForbidden, "forbidden")
 	}
 
@@ -500,6 +597,9 @@ func (s *server) updateUserConfig(c echo.Context) error {
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
 	}
+	if err := authorizeHumanOnly(principal, s.auth.enabled()); err != nil {
+		return writeForbidden(c)
+	}
 
 	namespace := s.namespace
 	if namespace == "" {
@@ -513,7 +613,7 @@ func (s *server) updateUserConfig(c echo.Context) error {
 	if err := s.client.Get(c.Request().Context(), client.ObjectKey{Name: name, Namespace: namespace}, spritz); err != nil {
 		return writeError(c, http.StatusNotFound, err.Error())
 	}
-	if s.auth.enabled() && !principal.IsAdmin && spritz.Spec.Owner.ID != principal.ID {
+	if err := authorizeHumanOwnedAccess(principal, spritz.Spec.Owner.ID, s.auth.enabled()); err != nil {
 		return writeError(c, http.StatusForbidden, "forbidden")
 	}
 
@@ -588,6 +688,9 @@ func (s *server) deleteSpritz(c echo.Context) error {
 	if s.auth.enabled() && (!ok || principal.ID == "") {
 		return writeError(c, http.StatusUnauthorized, "unauthenticated")
 	}
+	if err := authorizeHumanOnly(principal, s.auth.enabled()); err != nil {
+		return writeForbidden(c)
+	}
 
 	namespace := s.namespace
 	if namespace == "" {
@@ -601,7 +704,7 @@ func (s *server) deleteSpritz(c echo.Context) error {
 	if err := s.client.Get(c.Request().Context(), client.ObjectKey{Name: name, Namespace: namespace}, spritz); err != nil {
 		return writeError(c, http.StatusNotFound, err.Error())
 	}
-	if s.auth.enabled() && !principal.IsAdmin && spritz.Spec.Owner.ID != principal.ID {
+	if err := authorizeHumanOwnedAccess(principal, spritz.Spec.Owner.ID, s.auth.enabled()); err != nil {
 		return writeError(c, http.StatusForbidden, "forbidden")
 	}
 

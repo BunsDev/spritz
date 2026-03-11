@@ -45,6 +45,9 @@ type authConfig struct {
 	headerID                  string
 	headerEmail               string
 	headerTeams               string
+	headerType                string
+	headerScopes              string
+	headerDefaultType         principalType
 	adminIDs                  map[string]struct{}
 	adminTeams                map[string]struct{}
 	bearerIntrospectionURL    string
@@ -56,6 +59,9 @@ type authConfig struct {
 	bearerIDPaths             []string
 	bearerEmailPaths          []string
 	bearerTeamsPaths          []string
+	bearerTypePaths           []string
+	bearerScopesPaths         []string
+	bearerDefaultType         principalType
 	bearerAuthorizationHeader string
 	bearerJWKSURL             string
 	bearerJWKSIssuer          string
@@ -76,8 +82,20 @@ type principal struct {
 	ID      string
 	Email   string
 	Teams   []string
+	Type    principalType
+	Subject string
+	Issuer  string
+	Scopes  []string
 	IsAdmin bool
 }
+
+type principalType string
+
+const (
+	principalTypeHuman   principalType = "human"
+	principalTypeService principalType = "service"
+	principalTypeAdmin   principalType = "admin"
+)
 
 func newAuthConfig() authConfig {
 	return authConfig{
@@ -85,6 +103,9 @@ func newAuthConfig() authConfig {
 		headerID:                  envOrDefault("SPRITZ_AUTH_HEADER_ID", "X-Spritz-User-Id"),
 		headerEmail:               envOrDefault("SPRITZ_AUTH_HEADER_EMAIL", "X-Spritz-User-Email"),
 		headerTeams:               envOrDefault("SPRITZ_AUTH_HEADER_TEAMS", "X-Spritz-User-Teams"),
+		headerType:                envOrDefault("SPRITZ_AUTH_HEADER_TYPE", "X-Spritz-Principal-Type"),
+		headerScopes:              envOrDefault("SPRITZ_AUTH_HEADER_SCOPES", "X-Spritz-Principal-Scopes"),
+		headerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_HEADER_DEFAULT_TYPE", string(principalTypeHuman)), principalTypeHuman),
 		adminIDs:                  splitSet(os.Getenv("SPRITZ_AUTH_ADMIN_IDS")),
 		adminTeams:                splitSet(os.Getenv("SPRITZ_AUTH_ADMIN_TEAMS")),
 		bearerIntrospectionURL:    strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_INTROSPECTION_URL")),
@@ -96,6 +117,9 @@ func newAuthConfig() authConfig {
 		bearerIDPaths:             splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_ID_PATHS"), []string{"sub"}),
 		bearerEmailPaths:          splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_EMAIL_PATHS"), []string{"email"}),
 		bearerTeamsPaths:          splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TEAMS_PATHS"), nil),
+		bearerTypePaths:           splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TYPE_PATHS"), nil),
+		bearerScopesPaths:         splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_SCOPES_PATHS"), []string{"scope", "scopes", "scp"}),
+		bearerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_BEARER_DEFAULT_TYPE", string(principalTypeHuman)), principalTypeHuman),
 		bearerAuthorizationHeader: envOrDefault("SPRITZ_AUTH_BEARER_HEADER", "Authorization"),
 		bearerJWKSURL:             strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_JWKS_URL")),
 		bearerJWKSIssuer:          strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_ISSUER")),
@@ -129,6 +153,64 @@ func (a *authConfig) enabled() bool {
 	return a.mode != authModeNone
 }
 
+func normalizePrincipalType(raw string, fallback principalType) principalType {
+	switch principalType(strings.ToLower(strings.TrimSpace(raw))) {
+	case principalTypeHuman:
+		return principalTypeHuman
+	case principalTypeService:
+		return principalTypeService
+	case principalTypeAdmin:
+		return principalTypeAdmin
+	default:
+		return fallback
+	}
+}
+
+func finalizePrincipal(id, email string, teams []string, subject, issuer string, principalTypeValue principalType, scopes []string, admin bool) principal {
+	isAdmin := admin || principalTypeValue == principalTypeAdmin
+	if subject == "" {
+		subject = id
+	}
+	if isAdmin {
+		principalTypeValue = principalTypeAdmin
+	}
+	return principal{
+		ID:      id,
+		Email:   email,
+		Teams:   teams,
+		Type:    principalTypeValue,
+		Subject: subject,
+		Issuer:  strings.TrimSpace(issuer),
+		Scopes:  dedupeStrings(scopes),
+		IsAdmin: isAdmin,
+	}
+}
+
+func (p principal) isHuman() bool {
+	return p.Type == principalTypeHuman
+}
+
+func (p principal) isService() bool {
+	return p.Type == principalTypeService
+}
+
+func (p principal) isAdminPrincipal() bool {
+	return p.IsAdmin || p.Type == principalTypeAdmin
+}
+
+func (p principal) hasScope(scope string) bool {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return false
+	}
+	for _, candidate := range p.Scopes {
+		if strings.EqualFold(strings.TrimSpace(candidate), scope) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *authConfig) principal(r *http.Request) (principal, error) {
 	if !a.enabled() {
 		return principal{}, nil
@@ -142,23 +224,31 @@ func (a *authConfig) principal(r *http.Request) (principal, error) {
 		}
 		email := strings.TrimSpace(r.Header.Get(a.headerEmail))
 		teams := splitList(r.Header.Get(a.headerTeams))
-		return principal{
-			ID:      id,
-			Email:   email,
-			Teams:   teams,
-			IsAdmin: a.isAdmin(id, teams),
-		}, nil
+		return finalizePrincipal(
+			id,
+			email,
+			teams,
+			id,
+			"",
+			normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
+			splitList(r.Header.Get(a.headerScopes)),
+			a.isAdmin(id, teams),
+		), nil
 	case authModeAuto:
 		id := strings.TrimSpace(r.Header.Get(a.headerID))
 		if id != "" {
 			email := strings.TrimSpace(r.Header.Get(a.headerEmail))
 			teams := splitList(r.Header.Get(a.headerTeams))
-			return principal{
-				ID:      id,
-				Email:   email,
-				Teams:   teams,
-				IsAdmin: a.isAdmin(id, teams),
-			}, nil
+			return finalizePrincipal(
+				id,
+				email,
+				teams,
+				id,
+				"",
+				normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
+				splitList(r.Header.Get(a.headerScopes)),
+				a.isAdmin(id, teams),
+			), nil
 		}
 		if a.bearerIntrospectionURL == "" && a.bearerJWKSURL == "" {
 			return principal{}, errUnauthenticated
@@ -251,13 +341,16 @@ func (a *authConfig) introspectToken(ctx context.Context, token string) (princip
 
 	email := firstStringPath(payload, a.bearerEmailPaths)
 	teams := firstStringListPath(payload, a.bearerTeamsPaths)
-
-	return principal{
-		ID:      id,
-		Email:   email,
-		Teams:   teams,
-		IsAdmin: a.isAdmin(id, teams),
-	}, nil
+	return finalizePrincipal(
+		id,
+		email,
+		teams,
+		firstStringPath(payload, []string{"sub"}),
+		firstStringPath(payload, []string{"iss", "issuer"}),
+		normalizePrincipalType(firstStringPath(payload, a.bearerTypePaths), a.bearerDefaultType),
+		firstStringListPath(payload, a.bearerScopesPaths),
+		a.isAdmin(id, teams),
+	), nil
 }
 
 func (a *authConfig) jwks() (*keyfunc.JWKS, error) {
@@ -334,12 +427,16 @@ func (a *authConfig) principalFromJWT(ctx context.Context, token string) (princi
 	}
 	email := firstStringPath(claims, a.bearerEmailPaths)
 	teams := firstStringListPath(claims, a.bearerTeamsPaths)
-	return principal{
-		ID:      id,
-		Email:   email,
-		Teams:   teams,
-		IsAdmin: a.isAdmin(id, teams),
-	}, nil
+	return finalizePrincipal(
+		id,
+		email,
+		teams,
+		firstStringPath(claims, []string{"sub"}),
+		firstStringPath(claims, []string{"iss", "issuer"}),
+		normalizePrincipalType(firstStringPath(claims, a.bearerTypePaths), a.bearerDefaultType),
+		firstStringListPath(claims, a.bearerScopesPaths),
+		a.isAdmin(id, teams),
+	), nil
 }
 
 func verifyAudience(claims jwt.MapClaims, audiences []string) bool {
@@ -511,6 +608,30 @@ func splitListOrDefault(value string, fallback []string) []string {
 		return fallback
 	}
 	return items
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func parseDurationEnv(key string, fallback time.Duration) time.Duration {

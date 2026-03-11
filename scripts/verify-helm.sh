@@ -83,6 +83,10 @@ expect_contains "${auth_annotations_render}" "authonly: enabled" "auth ingress c
 expect_contains "${acp_network_policy_render}" "kind: NetworkPolicy" "ACP network policy when enabled"
 expect_contains "${acp_network_policy_render}" "name: spritz-acp" "ACP network policy name when enabled"
 expect_contains "${default_render}" 'resources: ["spritzes/status", "spritzconversations/status"]' "status RBAC for spritz conversations"
+expect_contains "${default_render}" "name: SPRITZ_AUTH_HEADER_TYPE" "principal type auth header wiring"
+expect_contains "${default_render}" "name: SPRITZ_AUTH_BEARER_SCOPES_PATHS" "bearer scope path wiring"
+expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_IDLE_TTL" "default provisioner idle ttl wiring"
+expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_TTL" "default provisioner ttl wiring"
 
 expect_failure \
   "api.auth.mode must be header or auto when authGateway.enabled=true" \

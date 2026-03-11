@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,12 +33,34 @@ func newCreateSpritzTestServer(t *testing.T) *server {
 		scheme:    scheme,
 		namespace: "spritz-test",
 		auth: authConfig{
-			mode:        authModeHeader,
-			headerID:    "X-Spritz-User-Id",
-			headerEmail: "X-Spritz-User-Email",
+			mode:              authModeHeader,
+			headerID:          "X-Spritz-User-Id",
+			headerEmail:       "X-Spritz-User-Email",
+			headerType:        "X-Spritz-Principal-Type",
+			headerScopes:      "X-Spritz-Principal-Scopes",
+			headerDefaultType: principalTypeHuman,
 		},
 		internalAuth:     internalAuthConfig{enabled: false},
 		userConfigPolicy: userConfigPolicy{},
+	}
+}
+
+func configureProvisionerTestServer(s *server) {
+	s.presets = presetCatalog{
+		byID: []runtimePreset{{
+			ID:         "openclaw",
+			Name:       "OpenClaw",
+			Image:      "example.com/spritz-openclaw:latest",
+			NamePrefix: "openclaw",
+		}},
+	}
+	s.provisioners = provisionerPolicy{
+		allowedPresetIDs: map[string]struct{}{"openclaw": {}},
+		defaultIdleTTL:   24 * time.Hour,
+		maxIdleTTL:       24 * time.Hour,
+		defaultTTL:       168 * time.Hour,
+		maxTTL:           168 * time.Hour,
+		rateWindow:       time.Hour,
 	}
 }
 
@@ -68,7 +91,11 @@ func TestCreateSpritzOwnerUsesIDAndOmitsEmail(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected data object in response, got %#v", payload["data"])
 	}
-	spec, ok := data["spec"].(map[string]any)
+	spritz, ok := data["spritz"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected spritz object in response, got %#v", data["spritz"])
+	}
+	spec, ok := spritz["spec"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected spec object in response, got %#v", data["spec"])
 	}
@@ -164,11 +191,134 @@ func TestCreateSpritzGeneratesPrefixedNameFromImage(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected data object in response, got %#v", payload["data"])
 	}
-	name, _ := data["metadata"].(map[string]any)["name"].(string)
+	spritz, ok := data["spritz"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected spritz object in response, got %#v", data["spritz"])
+	}
+	name, _ := spritz["metadata"].(map[string]any)["name"].(string)
 	if name == "" {
 		t.Fatal("expected generated metadata.name")
 	}
 	if !strings.HasPrefix(name, "claude-code-") {
 		t.Fatalf("expected generated name to start with %q, got %q", "claude-code-", name)
+	}
+}
+
+func TestCreateSpritzAllowsProvisionerToAssignOwnerOnce(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-1","source":"discord","requestId":"cmd-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response json: %v", err)
+	}
+	data := payload["data"].(map[string]any)
+	if data["ownerId"] != "user-123" {
+		t.Fatalf("expected ownerId user-123, got %#v", data["ownerId"])
+	}
+	if data["actorType"] != string(principalTypeService) {
+		t.Fatalf("expected actorType service, got %#v", data["actorType"])
+	}
+	if data["presetId"] != "openclaw" {
+		t.Fatalf("expected presetId openclaw, got %#v", data["presetId"])
+	}
+
+	spritzData := data["spritz"].(map[string]any)
+	annotations := spritzData["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if annotations[actorIDAnnotationKey] != "zenobot" {
+		t.Fatalf("expected actor annotation, got %#v", annotations[actorIDAnnotationKey])
+	}
+	if annotations[idempotencyKeyAnnotationKey] != "discord-1" {
+		t.Fatalf("expected idempotency annotation, got %#v", annotations[idempotencyKeyAnnotationKey])
+	}
+}
+
+func TestCreateSpritzReplaysIdempotentProvisionerRequest(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-2"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req1.Header.Set("X-Spritz-User-Id", "zenobot")
+	req1.Header.Set("X-Spritz-Principal-Type", "service")
+	req1.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected first create status 201, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req2.Header.Set("X-Spritz-User-Id", "zenobot")
+	req2.Header.Set("X-Spritz-Principal-Type", "service")
+	req2.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected replay status 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode replay response: %v", err)
+	}
+	data := payload["data"].(map[string]any)
+	if replayed, _ := data["replayed"].(bool); !replayed {
+		t.Fatalf("expected replayed response, got %#v", data["replayed"])
+	}
+}
+
+func TestCreateSpritzRejectsIdempotentProvisionerPayloadMismatch(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	first := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-3"}`)
+	second := []byte(`{"presetId":"openclaw","ownerId":"user-999","idempotencyKey":"discord-3"}`)
+
+	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(first))
+	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req1.Header.Set("X-Spritz-User-Id", "zenobot")
+	req1.Header.Set("X-Spritz-Principal-Type", "service")
+	req1.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected first create status 201, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(second))
+	req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req2.Header.Set("X-Spritz-User-Id", "zenobot")
+	req2.Header.Set("X-Spritz-Principal-Type", "service")
+	req2.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status 409, got %d: %s", rec2.Code, rec2.Body.String())
 	}
 }

@@ -41,8 +41,9 @@ func newACPTestServer(t *testing.T, objects ...client.Object) *server {
 		scheme:    scheme,
 		namespace: "spritz-test",
 		auth: authConfig{
-			mode:     authModeHeader,
-			headerID: "X-Spritz-User-Id",
+			mode:              authModeHeader,
+			headerID:          "X-Spritz-User-Id",
+			headerDefaultType: principalTypeHuman,
 		},
 		internalAuth: internalAuthConfig{enabled: false},
 		acp: acpConfig{

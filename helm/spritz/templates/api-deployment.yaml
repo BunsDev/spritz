@@ -54,6 +54,12 @@ spec:
               value: {{ .Values.api.auth.headerEmail | quote }}
             - name: SPRITZ_AUTH_HEADER_TEAMS
               value: {{ .Values.api.auth.headerTeams | quote }}
+            - name: SPRITZ_AUTH_HEADER_TYPE
+              value: {{ .Values.api.auth.headerType | quote }}
+            - name: SPRITZ_AUTH_HEADER_SCOPES
+              value: {{ .Values.api.auth.headerScopes | quote }}
+            - name: SPRITZ_AUTH_HEADER_DEFAULT_TYPE
+              value: {{ .Values.api.auth.headerDefaultType | quote }}
             {{- if .Values.api.auth.adminIds }}
             - name: SPRITZ_AUTH_ADMIN_IDS
               value: {{ join "," .Values.api.auth.adminIds | quote }}
@@ -98,6 +104,16 @@ spec:
             - name: SPRITZ_AUTH_BEARER_TEAMS_PATHS
               value: {{ join "," .Values.api.auth.bearer.teamsPaths | quote }}
             {{- end }}
+            {{- if .Values.api.auth.bearer.typePaths }}
+            - name: SPRITZ_AUTH_BEARER_TYPE_PATHS
+              value: {{ join "," .Values.api.auth.bearer.typePaths | quote }}
+            {{- end }}
+            {{- if .Values.api.auth.bearer.scopesPaths }}
+            - name: SPRITZ_AUTH_BEARER_SCOPES_PATHS
+              value: {{ join "," .Values.api.auth.bearer.scopesPaths | quote }}
+            {{- end }}
+            - name: SPRITZ_AUTH_BEARER_DEFAULT_TYPE
+              value: {{ .Values.api.auth.bearer.defaultType | quote }}
             {{- if .Values.api.auth.bearer.jwks.url }}
             - name: SPRITZ_AUTH_BEARER_JWKS_URL
               value: {{ .Values.api.auth.bearer.jwks.url | quote }}
@@ -200,6 +216,42 @@ spec:
               value: {{ .Values.acp.port | quote }}
             - name: SPRITZ_ACP_PATH
               value: {{ .Values.acp.path | quote }}
+            {{- if .Values.ui.presets }}
+            - name: SPRITZ_PRESETS
+              value: {{ .Values.ui.presets | toJson | quote }}
+            {{- end }}
+            - name: SPRITZ_PROVISIONER_DEFAULT_PRESET_ID
+              value: {{ .Values.api.provisioners.defaultPresetId | quote }}
+            {{- if .Values.api.provisioners.allowedPresetIds }}
+            - name: SPRITZ_PROVISIONER_ALLOWED_PRESET_IDS
+              value: {{ join "," .Values.api.provisioners.allowedPresetIds | quote }}
+            {{- end }}
+            - name: SPRITZ_PROVISIONER_ALLOW_CUSTOM_IMAGE
+              value: {{ .Values.api.provisioners.allowCustomImage | quote }}
+            - name: SPRITZ_PROVISIONER_ALLOW_CUSTOM_REPO
+              value: {{ .Values.api.provisioners.allowCustomRepo | quote }}
+            - name: SPRITZ_PROVISIONER_ALLOW_NAMESPACE_OVERRIDE
+              value: {{ .Values.api.provisioners.allowNamespaceOverride | quote }}
+            {{- if .Values.api.provisioners.allowedNamespaces }}
+            - name: SPRITZ_PROVISIONER_ALLOWED_NAMESPACES
+              value: {{ join "," .Values.api.provisioners.allowedNamespaces | quote }}
+            {{- end }}
+            - name: SPRITZ_PROVISIONER_DEFAULT_IDLE_TTL
+              value: {{ .Values.api.provisioners.defaultIdleTtl | quote }}
+            - name: SPRITZ_PROVISIONER_MAX_IDLE_TTL
+              value: {{ .Values.api.provisioners.maxIdleTtl | quote }}
+            - name: SPRITZ_PROVISIONER_DEFAULT_TTL
+              value: {{ .Values.api.provisioners.defaultTtl | quote }}
+            - name: SPRITZ_PROVISIONER_MAX_TTL
+              value: {{ .Values.api.provisioners.maxTtl | quote }}
+            - name: SPRITZ_PROVISIONER_MAX_ACTIVE_PER_OWNER
+              value: {{ .Values.api.provisioners.maxActivePerOwner | quote }}
+            - name: SPRITZ_PROVISIONER_MAX_CREATES_PER_ACTOR
+              value: {{ .Values.api.provisioners.maxCreatesPerActor | quote }}
+            - name: SPRITZ_PROVISIONER_MAX_CREATES_PER_OWNER
+              value: {{ .Values.api.provisioners.maxCreatesPerOwner | quote }}
+            - name: SPRITZ_PROVISIONER_RATE_WINDOW
+              value: {{ .Values.api.provisioners.rateWindow | quote }}
             {{- if .Values.api.acp.origins }}
             - name: SPRITZ_ACP_ORIGINS
               value: {{ join "," .Values.api.acp.origins | quote }}
