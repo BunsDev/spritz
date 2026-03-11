@@ -58,6 +58,8 @@ spec:
               value: {{ .Values.api.auth.headerType | quote }}
             - name: SPRITZ_AUTH_HEADER_SCOPES
               value: {{ .Values.api.auth.headerScopes | quote }}
+            - name: SPRITZ_AUTH_HEADER_TRUST_TYPE_AND_SCOPES
+              value: {{ .Values.api.auth.headerTrustTypeAndScopes | quote }}
             - name: SPRITZ_AUTH_HEADER_DEFAULT_TYPE
               value: {{ .Values.api.auth.headerDefaultType | quote }}
             {{- if .Values.api.auth.adminIds }}
@@ -277,6 +279,8 @@ spec:
               value: {{ .Values.api.sshGateway.principalPrefix | quote }}
             - name: SPRITZ_SSH_CERT_TTL
               value: {{ .Values.api.sshGateway.certTtl | quote }}
+            - name: SPRITZ_SSH_ACTIVITY_REFRESH
+              value: {{ .Values.api.sshGateway.activityRefresh | quote }}
             - name: SPRITZ_SSH_MINT_LIMIT
               value: {{ .Values.api.sshGateway.mintLimit | quote }}
             - name: SPRITZ_SSH_MINT_WINDOW

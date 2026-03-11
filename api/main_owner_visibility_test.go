@@ -26,10 +26,11 @@ func newListSpritzTestServer(t *testing.T, objects ...client.Object) *server {
 		scheme:    scheme,
 		namespace: "spritz-test",
 		auth: authConfig{
-			mode:              authModeHeader,
-			headerID:          "X-Spritz-User-Id",
-			headerType:        "X-Spritz-Principal-Type",
-			headerDefaultType: principalTypeHuman,
+			mode:                     authModeHeader,
+			headerID:                 "X-Spritz-User-Id",
+			headerType:               "X-Spritz-Principal-Type",
+			headerTrustTypeAndScopes: true,
+			headerDefaultType:        principalTypeHuman,
 		},
 		internalAuth: internalAuthConfig{enabled: false},
 	}

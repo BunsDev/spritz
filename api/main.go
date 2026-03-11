@@ -324,7 +324,6 @@ func (s *server) createSpritz(c echo.Context) error {
 		}
 	}
 
-	requestedNamespace := strings.TrimSpace(body.Namespace) != ""
 	requestedImage := strings.TrimSpace(body.Spec.Image) != ""
 	requestedRepo := body.Spec.Repo != nil || len(body.Spec.Repos) > 0
 	s.applyProvisionerDefaultPreset(&body, principal)
@@ -389,6 +388,8 @@ func (s *server) createSpritz(c echo.Context) error {
 	if err != nil {
 		return writeError(c, http.StatusForbidden, err.Error())
 	}
+	requestedNamespaceValue := strings.TrimSpace(body.Namespace)
+	requestedNamespace := requestedNamespaceValue != "" && requestedNamespaceValue != namespace
 
 	owner, err := normalizeCreateOwner(&body, principal, s.auth.enabled())
 	if err != nil {

@@ -69,6 +69,7 @@ func (c *createInterceptClient) Create(ctx context.Context, obj client.Object, o
 }
 
 func configureProvisionerTestServer(s *server) {
+	s.auth.headerTrustTypeAndScopes = true
 	s.presets = presetCatalog{
 		byID: []runtimePreset{{
 			ID:         "openclaw",
@@ -295,6 +296,27 @@ func TestCreateSpritzRejectsProvisionerWithoutOwnerID(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "ownerId is required") {
 		t.Fatalf("expected ownerId validation error, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateSpritzRejectsHeaderScopeSpoofingForOwnerAssignment(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"name":"spoofed-owner","ownerId":"user-999","idempotencyKey":"discord-spoof","spec":{"image":"example.com/spritz-openclaw:latest"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "user-123")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -711,6 +733,28 @@ func TestCreateSpritzUsesProvisionerDefaultPresetWhenPresetOmitted(t *testing.T)
 	spec := spritz["spec"].(map[string]any)
 	if image := spec["image"]; image != "example.com/spritz-openclaw:latest" {
 		t.Fatalf("expected preset image, got %#v", image)
+	}
+}
+
+func TestCreateSpritzAllowsProvisionerCurrentNamespaceWithoutOverride(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-current-ns","namespace":"spritz-test"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

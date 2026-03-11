@@ -131,6 +131,7 @@ api:
     headerTeams: X-Spritz-User-Teams
     headerType: X-Spritz-Principal-Type
     headerScopes: X-Spritz-Principal-Scopes
+    headerTrustTypeAndScopes: false
     headerDefaultType: human
     adminIds: []
     adminTeams: []
@@ -207,6 +208,7 @@ api:
     user: spritz
     principalPrefix: spritz
     certTtl: 15m
+    activityRefresh: 1m
     mintLimit: 5
     mintWindow: 1m
     mintBurst: 5

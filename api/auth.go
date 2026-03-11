@@ -47,6 +47,7 @@ type authConfig struct {
 	headerTeams               string
 	headerType                string
 	headerScopes              string
+	headerTrustTypeAndScopes  bool
 	headerDefaultType         principalType
 	adminIDs                  map[string]struct{}
 	adminTeams                map[string]struct{}
@@ -110,6 +111,7 @@ func newAuthConfig() authConfig {
 		headerTeams:               envOrDefault("SPRITZ_AUTH_HEADER_TEAMS", "X-Spritz-User-Teams"),
 		headerType:                envOrDefault("SPRITZ_AUTH_HEADER_TYPE", "X-Spritz-Principal-Type"),
 		headerScopes:              envOrDefault("SPRITZ_AUTH_HEADER_SCOPES", "X-Spritz-Principal-Scopes"),
+		headerTrustTypeAndScopes:  parseBoolEnv("SPRITZ_AUTH_HEADER_TRUST_TYPE_AND_SCOPES", false),
 		headerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_HEADER_DEFAULT_TYPE", string(principalTypeHuman)), principalTypeHuman),
 		adminIDs:                  splitSet(os.Getenv("SPRITZ_AUTH_ADMIN_IDS")),
 		adminTeams:                splitSet(os.Getenv("SPRITZ_AUTH_ADMIN_TEAMS")),
@@ -227,14 +229,20 @@ func (a *authConfig) principal(r *http.Request) (principal, error) {
 		}
 		email := strings.TrimSpace(r.Header.Get(a.headerEmail))
 		teams := splitList(r.Header.Get(a.headerTeams))
+		principalTypeValue := a.headerDefaultType
+		scopes := []string(nil)
+		if a.headerTrustTypeAndScopes {
+			principalTypeValue = normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType)
+			scopes = splitScopes(r.Header.Get(a.headerScopes))
+		}
 		return finalizePrincipal(
 			id,
 			email,
 			teams,
 			id,
 			"",
-			normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
-			splitScopes(r.Header.Get(a.headerScopes)),
+			principalTypeValue,
+			scopes,
 			a.isAdmin(id, teams),
 		), nil
 	case authModeAuto:
@@ -242,14 +250,20 @@ func (a *authConfig) principal(r *http.Request) (principal, error) {
 		if id != "" {
 			email := strings.TrimSpace(r.Header.Get(a.headerEmail))
 			teams := splitList(r.Header.Get(a.headerTeams))
+			principalTypeValue := a.headerDefaultType
+			scopes := []string(nil)
+			if a.headerTrustTypeAndScopes {
+				principalTypeValue = normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType)
+				scopes = splitScopes(r.Header.Get(a.headerScopes))
+			}
 			return finalizePrincipal(
 				id,
 				email,
 				teams,
 				id,
 				"",
-				normalizePrincipalType(r.Header.Get(a.headerType), a.headerDefaultType),
-				splitScopes(r.Header.Get(a.headerScopes)),
+				principalTypeValue,
+				scopes,
 				a.isAdmin(id, teams),
 			), nil
 		}
