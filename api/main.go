@@ -273,7 +273,7 @@ func (s *server) listPresets(c echo.Context) error {
 	if principal.isService() && !principal.hasScope(scopePresetsRead) && !principal.isAdminPrincipal() {
 		return writeError(c, http.StatusForbidden, "forbidden")
 	}
-	return writeJSON(c, http.StatusOK, map[string]any{"items": s.presets.all()})
+	return writeJSON(c, http.StatusOK, map[string]any{"items": s.presets.public()})
 }
 
 func (s *server) suggestSpritzName(c echo.Context) error {
@@ -431,29 +431,32 @@ func (s *server) createSpritz(c echo.Context) error {
 			return writeError(c, http.StatusBadRequest, err.Error())
 		}
 		reservedName, completed, err := s.reserveIdempotentCreateName(c.Request().Context(), namespace, principal, body.IdempotencyKey, fingerprint, body.Name)
-			if err != nil {
-				if strings.Contains(err.Error(), "idempotencyKey already used") {
-					return writeError(c, http.StatusConflict, err.Error())
-				}
-				return writeError(c, http.StatusInternalServerError, err.Error())
+		if err != nil {
+			if strings.Contains(err.Error(), "idempotencyKey already used") {
+				return writeError(c, http.StatusConflict, err.Error())
 			}
-			body.Name = reservedName
-			if completed {
-				existing, err := s.findReservedSpritz(c.Request().Context(), namespace, reservedName)
-				if err != nil {
-					return writeError(c, http.StatusInternalServerError, err.Error())
+			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		body.Name = reservedName
+		existing, err := s.findReservedSpritz(c.Request().Context(), namespace, reservedName)
+		if err != nil {
+			return writeError(c, http.StatusInternalServerError, err.Error())
+		}
+		if existing != nil {
+			if strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) != fingerprint {
+				if completed {
+					return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
 				}
-				if existing != nil {
-					if strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) != fingerprint {
-						return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
-					}
-					return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
-				}
-				return writeError(c, http.StatusConflict, "idempotencyKey already used")
+			} else {
+				return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
 			}
-			if err := s.enforceProvisionerQuotas(c.Request().Context(), namespace, principal, body.Spec.Owner.ID); err != nil {
-				return writeError(c, http.StatusBadRequest, err.Error())
-			}
+		}
+		if completed {
+			return writeError(c, http.StatusConflict, "idempotencyKey already used")
+		}
+		if err := s.enforceProvisionerQuotas(c.Request().Context(), namespace, principal, body.Spec.Owner.ID); err != nil {
+			return writeError(c, http.StatusBadRequest, err.Error())
+		}
 		body.Annotations = mergeStringMap(body.Annotations, map[string]string{
 			actorIDAnnotationKey:         principal.ID,
 			actorTypeAnnotationKey:       string(principal.Type),

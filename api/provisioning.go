@@ -57,6 +57,18 @@ type runtimePreset struct {
 	Env         []corev1.EnvVar `json:"env,omitempty"`
 }
 
+type publicPreset struct {
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Image       string `json:"image,omitempty"`
+	RepoURL     string `json:"repoUrl,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	TTL         string `json:"ttl,omitempty"`
+	IdleTTL     string `json:"idleTtl,omitempty"`
+	NamePrefix  string `json:"namePrefix,omitempty"`
+}
+
 type presetCatalog struct {
 	byID []runtimePreset
 }
@@ -373,6 +385,28 @@ func (c presetCatalog) all() []runtimePreset {
 	items := append([]runtimePreset(nil), c.byID...)
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items
+}
+
+func (c presetCatalog) public() []publicPreset {
+	items := c.all()
+	if len(items) == 0 {
+		return nil
+	}
+	publicItems := make([]publicPreset, 0, len(items))
+	for _, item := range items {
+		publicItems = append(publicItems, publicPreset{
+			ID:          item.ID,
+			Name:        item.Name,
+			Description: item.Description,
+			Image:       item.Image,
+			RepoURL:     item.RepoURL,
+			Branch:      item.Branch,
+			TTL:         item.TTL,
+			IdleTTL:     item.IdleTTL,
+			NamePrefix:  item.NamePrefix,
+		})
+	}
+	return publicItems
 }
 
 func (c presetCatalog) get(id string) (*runtimePreset, bool) {
