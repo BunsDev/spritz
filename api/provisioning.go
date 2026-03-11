@@ -152,6 +152,9 @@ func applyTopLevelCreateFields(body *createRequest) {
 
 func normalizeCreateOwner(body *createRequest, principal principal, authEnabled bool) (spritzv1.SpritzOwner, error) {
 	owner := body.Spec.Owner
+	if explicitOwner := strings.TrimSpace(body.OwnerID); explicitOwner != "" && strings.TrimSpace(owner.ID) != "" && explicitOwner != strings.TrimSpace(owner.ID) {
+		return owner, fmt.Errorf("ownerId conflicts with spec.owner.id")
+	}
 	if principal.isService() && strings.TrimSpace(body.OwnerID) == "" && strings.TrimSpace(owner.ID) == "" {
 		return owner, fmt.Errorf("ownerId is required")
 	}
@@ -245,7 +248,7 @@ func (p provisionerPolicy) validatePreset(presetID string) error {
 	return fmt.Errorf("preset is not allowed: %s", presetID)
 }
 
-func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
+func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint, namePrefixForFingerprint string) (string, error) {
 	if !principalCanUseProvisionerFlow(principal) {
 		return "", errForbidden
 	}
@@ -278,7 +281,7 @@ func (s *server) validateProvisionerCreate(ctx context.Context, principal princi
 	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, true); err != nil {
 		return "", err
 	}
-	return createFingerprint(body.Spec.Owner.ID, body.PresetID, nameForFingerprint, namespace, provisionerSource(body), body.Spec, userConfig)
+	return createFingerprint(body.Spec.Owner.ID, body.PresetID, nameForFingerprint, namePrefixForFingerprint, namespace, provisionerSource(body), body.Spec, userConfig)
 }
 
 func (s *server) enforceProvisionerQuotas(ctx context.Context, namespace string, principal principal, ownerID string) error {
@@ -504,7 +507,7 @@ func hashLabelValue(prefix, value string) string {
 	return fmt.Sprintf("%s-%x", prefix, sum[:12])
 }
 
-func createFingerprint(ownerID, presetID, name, namespace, source string, spec spritzv1.SpritzSpec, userConfig json.RawMessage) (string, error) {
+func createFingerprint(ownerID, presetID, name, namePrefix, namespace, source string, spec spritzv1.SpritzSpec, userConfig json.RawMessage) (string, error) {
 	specCopy := spec
 	specCopy.Annotations = nil
 	specCopy.Labels = nil
@@ -512,6 +515,7 @@ func createFingerprint(ownerID, presetID, name, namespace, source string, spec s
 		OwnerID    string              `json:"ownerId"`
 		PresetID   string              `json:"presetId,omitempty"`
 		Name       string              `json:"name,omitempty"`
+		NamePrefix string              `json:"namePrefix,omitempty"`
 		Namespace  string              `json:"namespace,omitempty"`
 		Source     string              `json:"source,omitempty"`
 		Spec       spritzv1.SpritzSpec `json:"spec"`
@@ -520,6 +524,7 @@ func createFingerprint(ownerID, presetID, name, namespace, source string, spec s
 		OwnerID:    ownerID,
 		PresetID:   presetID,
 		Name:       name,
+		NamePrefix: strings.TrimSpace(namePrefix),
 		Namespace:  namespace,
 		Source:     source,
 		Spec:       specCopy,

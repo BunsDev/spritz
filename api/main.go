@@ -419,7 +419,11 @@ func (s *server) createSpritz(c echo.Context) error {
 		if !nameProvided {
 			fingerprintName = ""
 		}
-		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
+		fingerprintNamePrefix := ""
+		if !nameProvided {
+			fingerprintNamePrefix = namePrefix
+		}
+		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace, fingerprintName, fingerprintNamePrefix)
 		if err != nil {
 			if errors.Is(err, errForbidden) {
 				return writeError(c, http.StatusForbidden, "forbidden")

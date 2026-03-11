@@ -298,6 +298,31 @@ func TestCreateSpritzRejectsProvisionerWithoutOwnerID(t *testing.T) {
 	}
 }
 
+func TestCreateSpritzRejectsProvisionerConflictingOwnerFields(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-owner-conflict","spec":{"owner":{"id":"user-999"}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ownerId conflicts with spec.owner.id") {
+		t.Fatalf("expected conflicting owner validation error, got %s", rec.Body.String())
+	}
+}
+
 func TestCreateSpritzReplaysIdempotentProvisionerRequest(t *testing.T) {
 	s := newCreateSpritzTestServer(t)
 	configureProvisionerTestServer(s)
@@ -389,6 +414,39 @@ func TestCreateSpritzRejectsIdempotentProvisionerPayloadMismatch(t *testing.T) {
 
 	first := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-3"}`)
 	second := []byte(`{"presetId":"openclaw","ownerId":"user-999","idempotencyKey":"discord-3"}`)
+
+	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(first))
+	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req1.Header.Set("X-Spritz-User-Id", "zenobot")
+	req1.Header.Set("X-Spritz-Principal-Type", "service")
+	req1.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected first create status 201, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(second))
+	req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req2.Header.Set("X-Spritz-User-Id", "zenobot")
+	req2.Header.Set("X-Spritz-Principal-Type", "service")
+	req2.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status 409, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestCreateSpritzRejectsIdempotentProvisionerRequestWhenNamePrefixChanges(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	first := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-prefix","namePrefix":"claude-code"}`)
+	second := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-prefix","namePrefix":"openclaw"}`)
 
 	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(first))
 	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
@@ -659,7 +717,7 @@ func TestCreateSpritzRetriesPendingIdempotencyReservationWithConflictingOccupant
 	if err := resolveCreateLifetimes(&body.Spec, s.provisioners, true); err != nil {
 		t.Fatalf("resolveCreateLifetimes failed: %v", err)
 	}
-	fingerprint, err := createFingerprint(body.Spec.Owner.ID, body.PresetID, "", s.namespace, provisionerSource(&body), body.Spec, nil)
+	fingerprint, err := createFingerprint(body.Spec.Owner.ID, body.PresetID, "", "openclaw", s.namespace, provisionerSource(&body), body.Spec, nil)
 	if err != nil {
 		t.Fatalf("createFingerprint failed: %v", err)
 	}
