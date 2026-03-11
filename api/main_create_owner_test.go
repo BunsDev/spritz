@@ -38,9 +38,10 @@ func newCreateSpritzTestServer(t *testing.T) *server {
 	t.Helper()
 	scheme := newTestSpritzScheme(t)
 	return &server{
-		client:    fake.NewClientBuilder().WithScheme(scheme).Build(),
-		scheme:    scheme,
-		namespace: "spritz-test",
+		client:           fake.NewClientBuilder().WithScheme(scheme).Build(),
+		scheme:           scheme,
+		namespace:        "spritz-test",
+		controlNamespace: "spritz-test",
 		auth: authConfig{
 			mode:              authModeHeader,
 			headerID:          "X-Spritz-User-Id",
@@ -755,6 +756,78 @@ func TestCreateSpritzAllowsProvisionerCurrentNamespaceWithoutOverride(t *testing
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected status 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateSpritzRejectsExplicitNamespaceForProvisionerWhenOverrideDisabled(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	s.namespace = ""
+	s.controlNamespace = "spritz-system"
+	s.provisioners.allowedNamespaces = map[string]struct{}{"team-a": {}}
+
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-ns-override","namespace":"team-a"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "namespace override is not allowed") {
+		t.Fatalf("expected namespace override error, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateSpritzRejectsProvisionerIdempotencyReuseAcrossNamespaces(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	s.namespace = ""
+	s.controlNamespace = "spritz-system"
+	s.provisioners.allowNamespaceOverride = true
+	s.provisioners.allowedNamespaces = map[string]struct{}{"team-a": {}, "team-b": {}}
+
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	first := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-cross-ns","namespace":"team-a"}`)
+	second := []byte(`{"presetId":"openclaw","ownerId":"user-123","idempotencyKey":"discord-cross-ns","namespace":"team-b"}`)
+
+	req1 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(first))
+	req1.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req1.Header.Set("X-Spritz-User-Id", "zenobot")
+	req1.Header.Set("X-Spritz-Principal-Type", "service")
+	req1.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected first create to succeed, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(second))
+	req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req2.Header.Set("X-Spritz-User-Id", "zenobot")
+	req2.Header.Set("X-Spritz-Principal-Type", "service")
+	req2.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "idempotencyKey already used with a different request") {
+		t.Fatalf("expected idempotency conflict, got %s", rec2.Body.String())
 	}
 }
 

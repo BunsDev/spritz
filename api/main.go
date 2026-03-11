@@ -34,6 +34,7 @@ type server struct {
 	restConfig           *rest.Config
 	scheme               *runtime.Scheme
 	namespace            string
+	controlNamespace     string
 	auth                 authConfig
 	internalAuth         internalAuthConfig
 	ingressDefaults      ingressDefaults
@@ -68,6 +69,16 @@ func main() {
 		os.Exit(1)
 	}
 	ns := os.Getenv("SPRITZ_NAMESPACE")
+	controlNamespace := strings.TrimSpace(os.Getenv("SPRITZ_CONTROL_NAMESPACE"))
+	if controlNamespace == "" {
+		controlNamespace = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+	}
+	if controlNamespace == "" {
+		controlNamespace = strings.TrimSpace(ns)
+	}
+	if controlNamespace == "" {
+		controlNamespace = "default"
+	}
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -129,6 +140,7 @@ func main() {
 		restConfig:        cfg,
 		scheme:            scheme,
 		namespace:         ns,
+		controlNamespace:  controlNamespace,
 		auth:              auth,
 		internalAuth:      internalAuth,
 		ingressDefaults:   ingressDefaults,
@@ -265,6 +277,17 @@ func (s *server) resolveSpritzNamespace(requested string) (string, error) {
 	return namespace, nil
 }
 
+func (s *server) namespaceOverrideRequested(requested, resolved string) bool {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return false
+	}
+	if strings.TrimSpace(s.namespace) == "" {
+		return true
+	}
+	return requested != strings.TrimSpace(resolved)
+}
+
 func (s *server) listPresets(c echo.Context) error {
 	principal, ok := principalFromContext(c)
 	if s.auth.enabled() && (!ok || principal.ID == "") {
@@ -388,8 +411,7 @@ func (s *server) createSpritz(c echo.Context) error {
 	if err != nil {
 		return writeError(c, http.StatusForbidden, err.Error())
 	}
-	requestedNamespaceValue := strings.TrimSpace(body.Namespace)
-	requestedNamespace := requestedNamespaceValue != "" && requestedNamespaceValue != namespace
+	requestedNamespace := s.namespaceOverrideRequested(body.Namespace, namespace)
 
 	owner, err := normalizeCreateOwner(&body, principal, s.auth.enabled())
 	if err != nil {
@@ -570,7 +592,7 @@ func (s *server) createSpritz(c echo.Context) error {
 			return writeError(c, http.StatusInternalServerError, err.Error())
 		}
 		if principal.isService() {
-			if err := s.completeIdempotencyReservation(c.Request().Context(), namespace, principal.ID, body.IdempotencyKey, spritz); err != nil {
+			if err := s.completeIdempotencyReservation(c.Request().Context(), principal.ID, body.IdempotencyKey, spritz); err != nil {
 				return writeError(c, http.StatusInternalServerError, err.Error())
 			}
 		}

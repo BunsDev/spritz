@@ -577,15 +577,26 @@ func idempotencyReservationName(actorID, key string) string {
 	return fmt.Sprintf("%s%x", idempotencyReservationPrefix, sum[:16])
 }
 
+func (s *server) idempotencyReservationNamespace() string {
+	if namespace := strings.TrimSpace(s.controlNamespace); namespace != "" {
+		return namespace
+	}
+	if namespace := strings.TrimSpace(s.namespace); namespace != "" {
+		return namespace
+	}
+	return "default"
+}
+
 func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace string, principal principal, key, fingerprint, desiredName string) (string, bool, error) {
 	if strings.TrimSpace(key) == "" {
 		return desiredName, false, nil
 	}
 	reservationName := idempotencyReservationName(principal.ID, key)
+	reservationNamespace := s.idempotencyReservationNamespace()
 	record := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      reservationName,
-			Namespace: namespace,
+			Namespace: reservationNamespace,
 			Labels: map[string]string{
 				actorLabelKey:       actorLabelValue(principal.ID),
 				idempotencyLabelKey: idempotencyLabelValue(key),
@@ -602,7 +613,7 @@ func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace stri
 			return "", false, err
 		}
 		existing := &corev1.ConfigMap{}
-		if getErr := s.client.Get(ctx, clientKey(namespace, reservationName), existing); getErr != nil {
+		if getErr := s.client.Get(ctx, clientKey(reservationNamespace, reservationName), existing); getErr != nil {
 			return "", false, getErr
 		}
 		if strings.TrimSpace(existing.Data[idempotencyReservationHashKey]) != fingerprint {
@@ -646,13 +657,14 @@ func (s *server) reserveIdempotentCreateName(ctx context.Context, namespace stri
 	return desiredName, false, nil
 }
 
-func (s *server) completeIdempotencyReservation(ctx context.Context, namespace, actorID, key string, spritz *spritzv1.Spritz) error {
+func (s *server) completeIdempotencyReservation(ctx context.Context, actorID, key string, spritz *spritzv1.Spritz) error {
 	if strings.TrimSpace(actorID) == "" || strings.TrimSpace(key) == "" || spritz == nil {
 		return nil
 	}
 	reservationName := idempotencyReservationName(actorID, key)
+	reservationNamespace := s.idempotencyReservationNamespace()
 	current := &corev1.ConfigMap{}
-	if err := s.client.Get(ctx, clientKey(namespace, reservationName), current); err != nil {
+	if err := s.client.Get(ctx, clientKey(reservationNamespace, reservationName), current); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
