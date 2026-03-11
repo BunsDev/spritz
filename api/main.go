@@ -29,26 +29,27 @@ import (
 )
 
 type server struct {
-	client            client.Client
-	clientset         *kubernetes.Clientset
-	restConfig        *rest.Config
-	scheme            *runtime.Scheme
-	namespace         string
-	auth              authConfig
-	internalAuth      internalAuthConfig
-	ingressDefaults   ingressDefaults
-	terminal          terminalConfig
-	sshGateway        sshGatewayConfig
-	sshDefaults       sshDefaults
-	sshMintLimiter    *sshMintLimiter
-	acp               acpConfig
-	presets           presetCatalog
-	provisioners      provisionerPolicy
-	defaultMetadata   map[string]string
-	sharedMounts      sharedMountsConfig
-	sharedMountsStore *sharedMountsStore
-	sharedMountsLive  *sharedMountsLatestNotifier
-	userConfigPolicy  userConfigPolicy
+	client               client.Client
+	clientset            *kubernetes.Clientset
+	restConfig           *rest.Config
+	scheme               *runtime.Scheme
+	namespace            string
+	auth                 authConfig
+	internalAuth         internalAuthConfig
+	ingressDefaults      ingressDefaults
+	terminal             terminalConfig
+	sshGateway           sshGatewayConfig
+	sshDefaults          sshDefaults
+	sshMintLimiter       *sshMintLimiter
+	acp                  acpConfig
+	presets              presetCatalog
+	provisioners         provisionerPolicy
+	defaultMetadata      map[string]string
+	sharedMounts         sharedMountsConfig
+	sharedMountsStore    *sharedMountsStore
+	sharedMountsLive     *sharedMountsLatestNotifier
+	userConfigPolicy     userConfigPolicy
+	nameGeneratorFactory func(context.Context, string, string) (func() string, error)
 }
 
 func main() {
@@ -533,6 +534,9 @@ func (s *server) createSpritz(c echo.Context) error {
 				}
 				if existing != nil && strings.TrimSpace(existing.Annotations[idempotencyHashAnnotationKey]) == strings.TrimSpace(annotations[idempotencyHashAnnotationKey]) {
 					return writeJSON(c, http.StatusOK, summarizeCreateResponse(existing, principal, body.PresetID, provisionerSource(&body), body.IdempotencyKey, true))
+				}
+				if !nameProvided {
+					continue
 				}
 				return writeError(c, http.StatusConflict, "idempotencyKey already used with a different request")
 			}

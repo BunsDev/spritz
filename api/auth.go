@@ -119,7 +119,7 @@ func newAuthConfig() authConfig {
 		bearerTeamsPaths:          splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TEAMS_PATHS"), nil),
 		bearerTypePaths:           splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_TYPE_PATHS"), nil),
 		bearerScopesPaths:         splitListOrDefault(os.Getenv("SPRITZ_AUTH_BEARER_SCOPES_PATHS"), []string{"scope", "scopes", "scp"}),
-		bearerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_BEARER_DEFAULT_TYPE", string(principalTypeHuman)), principalTypeHuman),
+		bearerDefaultType:         normalizePrincipalType(envOrDefault("SPRITZ_AUTH_BEARER_DEFAULT_TYPE", string(principalTypeService)), principalTypeService),
 		bearerAuthorizationHeader: envOrDefault("SPRITZ_AUTH_BEARER_HEADER", "Authorization"),
 		bearerJWKSURL:             strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_JWKS_URL")),
 		bearerJWKSIssuer:          strings.TrimSpace(os.Getenv("SPRITZ_AUTH_BEARER_ISSUER")),

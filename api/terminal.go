@@ -165,7 +165,7 @@ func (s *server) openTerminal(c echo.Context) error {
 	if usingZmx {
 		log.Printf("spritz terminal: zmx attach name=%s namespace=%s session=%s user_id=%s", name, namespace, resolvedSession, principal.ID)
 	}
-	if err := s.streamTerminal(c.Request().Context(), pod, conn, command); err != nil {
+	if err := s.streamTerminal(c.Request().Context(), namespace, name, pod, conn, command); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -202,7 +202,7 @@ func (s *server) findRunningPod(ctx context.Context, namespace, name, container 
 	return nil, fmt.Errorf("spritz not ready")
 }
 
-func (s *server) streamTerminal(ctx context.Context, pod *corev1.Pod, conn *websocket.Conn, command []string) error {
+func (s *server) streamTerminal(ctx context.Context, namespace, name string, pod *corev1.Pod, conn *websocket.Conn, command []string) error {
 	if len(command) == 0 {
 		return errors.New("terminal command missing")
 	}
@@ -236,7 +236,13 @@ func (s *server) streamTerminal(ctx context.Context, pod *corev1.Pod, conn *webs
 
 	readErr := make(chan error, 1)
 	go func() {
-		readErr <- readTerminalInput(ctx, conn, stdinWriter, sizeQueue)
+		readErr <- readTerminalInput(ctx, conn, stdinWriter, sizeQueue, func() {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := s.markSpritzActivity(refreshCtx, namespace, name, time.Now()); err != nil {
+				log.Printf("spritz terminal: failed to refresh activity name=%s namespace=%s pod=%s err=%v", name, namespace, pod.Name, err)
+			}
+		})
 	}()
 
 	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
@@ -268,7 +274,7 @@ type resizeMessage struct {
 	Rows int    `json:"rows"`
 }
 
-func readTerminalInput(ctx context.Context, conn *websocket.Conn, stdin *io.PipeWriter, sizeQueue *terminalSizeQueue) error {
+func readTerminalInput(ctx context.Context, conn *websocket.Conn, stdin *io.PipeWriter, sizeQueue *terminalSizeQueue, onInput func()) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -289,6 +295,9 @@ func readTerminalInput(ctx context.Context, conn *websocket.Conn, stdin *io.Pipe
 		if msgType == websocket.BinaryMessage || msgType == websocket.TextMessage {
 			if _, err := stdin.Write(payload); err != nil {
 				return err
+			}
+			if onInput != nil {
+				onInput()
 			}
 		}
 	}
