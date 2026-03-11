@@ -470,3 +470,67 @@ func TestCreateSpritzRetriesGeneratedServiceNameAfterAlreadyExists(t *testing.T)
 		t.Fatalf("expected second generated name after race, got %#v", name)
 	}
 }
+
+func TestCreateSpritzRejectsProvisionerLowLevelSpecFields(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{
+		"presetId":"openclaw",
+		"ownerId":"user-123",
+		"idempotencyKey":"discord-low-level",
+		"spec":{
+			"env":[{"name":"SHOULD_NOT_PASS","value":"1"}]
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "spec.env is not allowed") {
+		t.Fatalf("expected low-level spec validation error, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateSpritzRejectsProvisionerUserConfigOverrides(t *testing.T) {
+	s := newCreateSpritzTestServer(t)
+	configureProvisionerTestServer(s)
+	e := echo.New()
+	secured := e.Group("", s.authMiddleware())
+	secured.POST("/api/spritzes", s.createSpritz)
+
+	body := []byte(`{
+		"presetId":"openclaw",
+		"ownerId":"user-123",
+		"idempotencyKey":"discord-user-config",
+		"userConfig":{
+			"repo":{"url":"https://example.com/private.git"}
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/spritzes", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("X-Spritz-User-Id", "zenobot")
+	req.Header.Set("X-Spritz-Principal-Type", "service")
+	req.Header.Set("X-Spritz-Principal-Scopes", "spritz.instances.create,spritz.instances.assign_owner")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "userConfig is not allowed") {
+		t.Fatalf("expected service userConfig validation error, got %s", rec.Body.String())
+	}
+}

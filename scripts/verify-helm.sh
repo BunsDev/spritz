@@ -85,8 +85,11 @@ expect_contains "${acp_network_policy_render}" "name: spritz-acp" "ACP network p
 expect_contains "${default_render}" 'resources: ["spritzes/status", "spritzconversations/status"]' "status RBAC for spritz conversations"
 expect_contains "${default_render}" "name: SPRITZ_AUTH_HEADER_TYPE" "principal type auth header wiring"
 expect_contains "${default_render}" "name: SPRITZ_AUTH_BEARER_SCOPES_PATHS" "bearer scope path wiring"
+expect_contains "${default_render}" "name: SPRITZ_AUTH_BEARER_DEFAULT_TYPE" "bearer default type wiring"
+expect_contains "${default_render}" "value: \"service\"" "service default bearer principal type in chart render"
 expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_IDLE_TTL" "default provisioner idle ttl wiring"
 expect_contains "${default_render}" "name: SPRITZ_PROVISIONER_DEFAULT_TTL" "default provisioner ttl wiring"
+expect_contains "${default_render}" "name: SPRITZ_TERMINAL_ACTIVITY_DEBOUNCE" "terminal activity debounce wiring"
 expect_contains "${default_render}" 'resources: ["configmaps"]' "configmap RBAC for idempotency reservations"
 
 expect_failure \

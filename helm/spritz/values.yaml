@@ -162,7 +162,7 @@ api:
         - scope
         - scopes
         - scp
-      defaultType: human
+      defaultType: service
   provisioners:
     defaultPresetId: ""
     allowedPresetIds: []
@@ -196,6 +196,7 @@ api:
     container: spritz
     command: "bash -l"
     origins: []
+    activityDebounce: 5s
   acp:
     origins: []
   sshGateway:

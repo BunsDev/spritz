@@ -27,11 +27,12 @@ import (
 )
 
 type terminalConfig struct {
-	enabled        bool
-	containerName  string
-	command        []string
-	allowedOrigins map[string]struct{}
-	sessionMode    terminalSessionMode
+	enabled          bool
+	containerName    string
+	command          []string
+	allowedOrigins   map[string]struct{}
+	sessionMode      terminalSessionMode
+	activityDebounce time.Duration
 }
 
 type terminalSessionMode string
@@ -43,11 +44,12 @@ const (
 
 func newTerminalConfig() terminalConfig {
 	return terminalConfig{
-		enabled:        parseBoolEnv("SPRITZ_TERMINAL_ENABLED", true),
-		containerName:  envOrDefault("SPRITZ_TERMINAL_CONTAINER", "spritz"),
-		command:        splitCommand(envOrDefault("SPRITZ_TERMINAL_COMMAND", "bash -l")),
-		allowedOrigins: splitSet(os.Getenv("SPRITZ_TERMINAL_ORIGINS")),
-		sessionMode:    parseTerminalSessionMode(os.Getenv("SPRITZ_TERMINAL_SESSION_MODE")),
+		enabled:          parseBoolEnv("SPRITZ_TERMINAL_ENABLED", true),
+		containerName:    envOrDefault("SPRITZ_TERMINAL_CONTAINER", "spritz"),
+		command:          splitCommand(envOrDefault("SPRITZ_TERMINAL_COMMAND", "bash -l")),
+		allowedOrigins:   splitSet(os.Getenv("SPRITZ_TERMINAL_ORIGINS")),
+		sessionMode:      parseTerminalSessionMode(os.Getenv("SPRITZ_TERMINAL_SESSION_MODE")),
+		activityDebounce: parseDurationEnv("SPRITZ_TERMINAL_ACTIVITY_DEBOUNCE", 5*time.Second),
 	}
 }
 
@@ -233,16 +235,17 @@ func (s *server) streamTerminal(ctx context.Context, namespace, name string, pod
 	stdinReader, stdinWriter := io.Pipe()
 	sizeQueue := newTerminalSizeQueue()
 	wsWriter := &terminalWSWriter{conn: conn}
+	reportActivity := debounceTerminalActivity(s.terminal.activityDebounce, func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.markSpritzActivity(refreshCtx, namespace, name, time.Now()); err != nil {
+			log.Printf("spritz terminal: failed to refresh activity name=%s namespace=%s pod=%s err=%v", name, namespace, pod.Name, err)
+		}
+	})
 
 	readErr := make(chan error, 1)
 	go func() {
-		readErr <- readTerminalInput(ctx, conn, stdinWriter, sizeQueue, func() {
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := s.markSpritzActivity(refreshCtx, namespace, name, time.Now()); err != nil {
-				log.Printf("spritz terminal: failed to refresh activity name=%s namespace=%s pod=%s err=%v", name, namespace, pod.Name, err)
-			}
-		})
+		readErr <- readTerminalInput(ctx, conn, stdinWriter, sizeQueue, reportActivity)
 	}()
 
 	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
@@ -300,6 +303,28 @@ func readTerminalInput(ctx context.Context, conn *websocket.Conn, stdin *io.Pipe
 				onInput()
 			}
 		}
+	}
+}
+
+func debounceTerminalActivity(interval time.Duration, report func()) func() {
+	if report == nil {
+		return func() {}
+	}
+	if interval <= 0 {
+		return report
+	}
+	var mu sync.Mutex
+	var last time.Time
+	return func() {
+		now := time.Now()
+		mu.Lock()
+		if !last.IsZero() && now.Sub(last) < interval {
+			mu.Unlock()
+			return
+		}
+		last = now
+		mu.Unlock()
+		report()
 	}
 }
 

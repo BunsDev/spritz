@@ -85,3 +85,23 @@ func TestReadTerminalInputInvokesActivityCallbackOnInput(t *testing.T) {
 		t.Fatal("timed out waiting for terminal reader to exit")
 	}
 }
+
+func TestDebounceTerminalActivityCoalescesRapidInput(t *testing.T) {
+	var callbacks atomic.Int32
+	report := debounceTerminalActivity(50*time.Millisecond, func() {
+		callbacks.Add(1)
+	})
+
+	report()
+	report()
+	report()
+	if callbacks.Load() != 1 {
+		t.Fatalf("expected rapid calls to coalesce into one activity write, got %d", callbacks.Load())
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	report()
+	if callbacks.Load() != 2 {
+		t.Fatalf("expected a second activity write after debounce window, got %d", callbacks.Load())
+	}
+}

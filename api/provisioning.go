@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -148,6 +149,58 @@ func normalizeCreateOwner(body *createRequest, principal principal, authEnabled 
 	return owner, nil
 }
 
+func validateProvisionerRequestSurface(body *createRequest, userConfigKeys map[string]json.RawMessage) error {
+	if body == nil {
+		return nil
+	}
+	if len(userConfigKeys) > 0 {
+		return fmt.Errorf("userConfig is not allowed for service principals")
+	}
+	if body.Spec.Owner.Team != "" {
+		return fmt.Errorf("spec.owner.team is not allowed")
+	}
+	if len(body.Labels) > 0 {
+		return fmt.Errorf("labels are not allowed for service principals")
+	}
+	if len(body.Annotations) > 0 {
+		return fmt.Errorf("annotations are not allowed for service principals")
+	}
+	if len(body.Spec.Labels) > 0 {
+		return fmt.Errorf("spec.labels are not allowed")
+	}
+	if len(body.Spec.Annotations) > 0 {
+		return fmt.Errorf("spec.annotations are not allowed")
+	}
+	if len(body.Spec.Env) > 0 {
+		return fmt.Errorf("spec.env is not allowed")
+	}
+	if len(body.Spec.Repos) > 0 {
+		return fmt.Errorf("spec.repos is not allowed")
+	}
+	if body.Spec.Repo != nil && body.Spec.Repo.Auth != nil {
+		return fmt.Errorf("spec.repo.auth is not allowed")
+	}
+	if len(body.Spec.SharedMounts) > 0 {
+		return fmt.Errorf("spec.sharedMounts is not allowed")
+	}
+	if !reflect.DeepEqual(body.Spec.Resources, corev1.ResourceRequirements{}) {
+		return fmt.Errorf("spec.resources is not allowed")
+	}
+	if body.Spec.Features != nil {
+		return fmt.Errorf("spec.features is not allowed")
+	}
+	if body.Spec.SSH != nil {
+		return fmt.Errorf("spec.ssh is not allowed")
+	}
+	if len(body.Spec.Ports) > 0 {
+		return fmt.Errorf("spec.ports is not allowed")
+	}
+	if body.Spec.Ingress != nil {
+		return fmt.Errorf("spec.ingress is not allowed")
+	}
+	return nil
+}
+
 func provisionerSource(body *createRequest) string {
 	source := strings.TrimSpace(body.Source)
 	if source == "" {
@@ -182,7 +235,7 @@ func (p provisionerPolicy) validatePreset(presetID string) error {
 	return fmt.Errorf("preset is not allowed: %s", presetID)
 }
 
-func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
+func (s *server) validateProvisionerCreate(ctx context.Context, principal principal, namespace string, body *createRequest, userConfig json.RawMessage, userConfigKeys map[string]json.RawMessage, requestedImage, requestedRepo, requestedNamespace bool, nameForFingerprint string) (string, error) {
 	if !principalCanUseProvisionerFlow(principal) {
 		return "", errForbidden
 	}
@@ -191,6 +244,11 @@ func (s *server) validateProvisionerCreate(ctx context.Context, principal princi
 	}
 	if err := authorizeServiceAction(principal, scopeInstancesAssignOwner, true); err != nil {
 		return "", err
+	}
+	if principal.isService() {
+		if err := validateProvisionerRequestSurface(body, userConfigKeys); err != nil {
+			return "", err
+		}
 	}
 	if requestedNamespace && !s.provisioners.allowNamespaceOverride {
 		return "", fmt.Errorf("namespace override is not allowed")

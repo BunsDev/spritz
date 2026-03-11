@@ -330,6 +330,9 @@ func (s *server) createSpritz(c echo.Context) error {
 	if err != nil {
 		return writeError(c, http.StatusBadRequest, err.Error())
 	}
+	if principal.isService() && len(userConfigKeys) > 0 {
+		return writeError(c, http.StatusBadRequest, "userConfig is not allowed for service principals")
+	}
 	var normalizedUserConfig json.RawMessage
 	if len(userConfigKeys) > 0 {
 		normalized, err := normalizeUserConfig(s.userConfigPolicy, userConfigKeys, userConfigPayload)
@@ -343,6 +346,12 @@ func (s *server) createSpritz(c echo.Context) error {
 		}
 		normalizedUserConfig = encodedUserConfig
 		applyUserConfig(&body.Spec, userConfigKeys, userConfigPayload)
+		if _, ok := userConfigKeys["image"]; ok {
+			requestedImage = strings.TrimSpace(body.Spec.Image) != ""
+		}
+		if _, ok := userConfigKeys["repo"]; ok {
+			requestedRepo = body.Spec.Repo != nil || len(body.Spec.Repos) > 0
+		}
 	}
 
 	if body.Spec.Image == "" {
@@ -403,7 +412,7 @@ func (s *server) createSpritz(c echo.Context) error {
 		if !nameProvided {
 			fingerprintName = ""
 		}
-		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
+		fingerprint, err := s.validateProvisionerCreate(c.Request().Context(), principal, namespace, &body, normalizedUserConfig, userConfigKeys, requestedImage, requestedRepo, requestedNamespace, fingerprintName)
 		if err != nil {
 			if errors.Is(err, errForbidden) {
 				return writeError(c, http.StatusForbidden, "forbidden")

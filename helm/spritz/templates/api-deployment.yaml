@@ -209,6 +209,10 @@ spec:
             - name: SPRITZ_TERMINAL_ORIGINS
               value: {{ join "," .Values.api.terminal.origins | quote }}
             {{- end }}
+            {{- if .Values.api.terminal.activityDebounce }}
+            - name: SPRITZ_TERMINAL_ACTIVITY_DEBOUNCE
+              value: {{ .Values.api.terminal.activityDebounce | quote }}
+            {{- end }}
             {{- end }}
             - name: SPRITZ_ACP_ENABLED
               value: {{ .Values.acp.enabled | quote }}
