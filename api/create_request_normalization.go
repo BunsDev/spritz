@@ -15,6 +15,7 @@ import (
 type createRequestError struct {
 	status  int
 	message string
+	data    any
 	err     error
 }
 
@@ -34,9 +35,21 @@ func newCreateRequestError(status int, err error) error {
 	}
 }
 
+func newCreateRequestErrorWithData(status int, message string, data any, err error) error {
+	return &createRequestError{
+		status:  status,
+		message: message,
+		data:    data,
+		err:     err,
+	}
+}
+
 func writeCreateRequestError(c echo.Context, err error) error {
 	var requestErr *createRequestError
 	if errors.As(err, &requestErr) {
+		if requestErr.data != nil {
+			return writeJSendFailData(c, requestErr.status, requestErr.data)
+		}
 		return writeError(c, requestErr.status, requestErr.message)
 	}
 	return writeError(c, http.StatusInternalServerError, err.Error())
@@ -73,11 +86,20 @@ func (s *server) normalizeCreateRequest(_ context.Context, principal principal, 
 	}
 	requestedNamespace := s.namespaceOverrideRequested(body.Namespace, namespace)
 
-	owner, err := normalizeCreateOwner(&body, principal, s.auth.enabled())
+	owner, err := normalizeCreateOwnerRequest(&body, principal, s.auth.enabled())
 	if err != nil {
+		if errors.Is(err, errForbidden) {
+			return nil, newCreateRequestError(http.StatusForbidden, err)
+		}
 		return nil, newCreateRequestError(http.StatusBadRequest, err)
 	}
-	body.Spec.Owner = owner
+	if body.OwnerRef != nil && strings.EqualFold(strings.TrimSpace(body.OwnerRef.Type), "external") {
+		if !principal.isService() {
+			return nil, newCreateRequestError(http.StatusForbidden, errForbidden)
+		}
+	} else {
+		body.Spec.Owner = owner
+	}
 	fingerprintRequest := body
 
 	requestedImage := strings.TrimSpace(body.Spec.Image) != ""

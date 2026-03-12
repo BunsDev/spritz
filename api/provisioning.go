@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"reflect"
 	"sort"
@@ -21,10 +22,11 @@ import (
 )
 
 const (
-	scopeInstancesCreate      = "spritz.instances.create"
-	scopeInstancesAssignOwner = "spritz.instances.assign_owner"
-	scopePresetsRead          = "spritz.presets.read"
-	scopeInstancesSuggestName = "spritz.instances.suggest_name"
+	scopeInstancesCreate          = "spritz.instances.create"
+	scopeInstancesAssignOwner     = "spritz.instances.assign_owner"
+	scopePresetsRead              = "spritz.presets.read"
+	scopeInstancesSuggestName     = "spritz.instances.suggest_name"
+	scopeExternalResolveViaCreate = "spritz.external_identities.resolve_via_create"
 
 	actorIDAnnotationKey          = "spritz.sh/actor.id"
 	actorTypeAnnotationKey        = "spritz.sh/actor.type"
@@ -126,16 +128,25 @@ type suggestNameMetadata struct {
 }
 
 type idempotentCreatePayload struct {
-	PresetID   string              `json:"presetId,omitempty"`
-	NamePrefix string              `json:"namePrefix,omitempty"`
-	Source     string              `json:"source,omitempty"`
-	RequestID  string              `json:"requestId,omitempty"`
-	Spec       spritzv1.SpritzSpec `json:"spec"`
+	PresetID      string                          `json:"presetId,omitempty"`
+	NamePrefix    string                          `json:"namePrefix,omitempty"`
+	Source        string                          `json:"source,omitempty"`
+	RequestID     string                          `json:"requestId,omitempty"`
+	Spec          spritzv1.SpritzSpec             `json:"spec"`
+	ExternalOwner *idempotentExternalOwnerPayload `json:"externalOwner,omitempty"`
 }
 
 type provisionerIdempotencyState struct {
 	canonicalFingerprint string
 	resolvedPayload      string
+}
+
+type idempotentExternalOwnerPayload struct {
+	Issuer      string `json:"issuer,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Tenant      string `json:"tenant,omitempty"`
+	SubjectHash string `json:"subjectHash,omitempty"`
+	ResolvedAt  string `json:"resolvedAt,omitempty"`
 }
 
 func (s *server) applyCreatePreset(body *createRequest) (*runtimePreset, error) {
@@ -201,8 +212,46 @@ func applyTopLevelCreateFields(body *createRequest) {
 	body.IdempotencyKey = strings.TrimSpace(body.IdempotencyKey)
 }
 
-func normalizeCreateOwner(body *createRequest, principal principal, authEnabled bool) (spritzv1.SpritzOwner, error) {
+func normalizeCreateOwnerRequest(body *createRequest, principal principal, authEnabled bool) (spritzv1.SpritzOwner, error) {
 	owner := body.Spec.Owner
+	if body.OwnerRef != nil {
+		ref := *body.OwnerRef
+		ref.Type = strings.ToLower(strings.TrimSpace(ref.Type))
+		ref.ID = strings.TrimSpace(ref.ID)
+		switch ref.Type {
+		case "":
+			return owner, fmt.Errorf("ownerRef.type is required")
+		case "owner":
+			if ref.ID == "" {
+				return owner, fmt.Errorf("ownerRef.id is required when ownerRef.type=owner")
+			}
+			if explicitOwner := strings.TrimSpace(body.OwnerID); explicitOwner != "" && explicitOwner != ref.ID {
+				return owner, fmt.Errorf("ownerId conflicts with ownerRef.id")
+			}
+			if strings.TrimSpace(owner.ID) != "" && strings.TrimSpace(owner.ID) != ref.ID {
+				return owner, fmt.Errorf("ownerRef.id conflicts with spec.owner.id")
+			}
+			body.OwnerID = ref.ID
+			body.OwnerRef = &ownerRef{Type: "owner", ID: ref.ID}
+			owner.ID = ref.ID
+			body.Spec.Owner = owner
+		case "external":
+			normalized, err := normalizeExternalOwnerRef(ref)
+			if err != nil {
+				return owner, err
+			}
+			if strings.TrimSpace(body.OwnerID) != "" {
+				return owner, fmt.Errorf("ownerId conflicts with ownerRef")
+			}
+			if strings.TrimSpace(owner.ID) != "" {
+				return owner, fmt.Errorf("spec.owner.id conflicts with ownerRef")
+			}
+			body.OwnerRef = &normalized
+			return owner, nil
+		default:
+			return owner, fmt.Errorf("ownerRef.type must be owner or external")
+		}
+	}
 	if explicitOwner := strings.TrimSpace(body.OwnerID); explicitOwner != "" && strings.TrimSpace(owner.ID) != "" && explicitOwner != strings.TrimSpace(owner.ID) {
 		return owner, fmt.Errorf("ownerId conflicts with spec.owner.id")
 	}
@@ -217,6 +266,66 @@ func normalizeCreateOwner(body *createRequest, principal principal, authEnabled 
 		}
 	}
 	return owner, nil
+}
+
+func normalizeCreateOwner(body *createRequest, principal principal, authEnabled bool) (spritzv1.SpritzOwner, error) {
+	owner, err := normalizeCreateOwnerRequest(body, principal, authEnabled)
+	if err != nil {
+		return owner, err
+	}
+	if body != nil && body.OwnerRef != nil && strings.EqualFold(strings.TrimSpace(body.OwnerRef.Type), "external") {
+		return owner, fmt.Errorf("ownerRef.type=external requires external resolution")
+	}
+	return owner, nil
+}
+
+func (s *server) resolveCreateOwner(ctx context.Context, body *createRequest, principal principal) (spritzv1.SpritzOwner, *externalOwnerResolution, error) {
+	if body != nil && body.OwnerRef != nil && strings.EqualFold(strings.TrimSpace(body.OwnerRef.Type), "external") {
+		normalizedRef, err := normalizeExternalOwnerRef(*body.OwnerRef)
+		if err != nil {
+			return spritzv1.SpritzOwner{}, nil, err
+		}
+		body.OwnerRef = &normalizedRef
+		if strings.TrimSpace(body.OwnerID) != "" {
+			return spritzv1.SpritzOwner{}, nil, fmt.Errorf("ownerId conflicts with ownerRef")
+		}
+		if strings.TrimSpace(body.Spec.Owner.ID) != "" {
+			return spritzv1.SpritzOwner{}, nil, fmt.Errorf("spec.owner.id conflicts with ownerRef")
+		}
+		if !principalCanUseProvisionerFlow(principal) {
+			return spritzv1.SpritzOwner{}, nil, errForbidden
+		}
+		if err := authorizeServiceAction(principal, scopeInstancesCreate, true); err != nil {
+			return spritzv1.SpritzOwner{}, nil, errForbidden
+		}
+		if err := authorizeServiceAction(principal, scopeInstancesAssignOwner, true); err != nil {
+			return spritzv1.SpritzOwner{}, nil, errForbidden
+		}
+		if err := authorizeServiceAction(principal, scopeExternalResolveViaCreate, true); err != nil {
+			return spritzv1.SpritzOwner{}, nil, errForbidden
+		}
+		if !s.externalOwners.enabled() {
+			return spritzv1.SpritzOwner{}, nil, externalOwnerResolutionError{
+				status:   http.StatusForbidden,
+				code:     "external_identity_forbidden",
+				message:  "external identity resolution is not configured",
+				provider: normalizedRef.Provider,
+				tenant:   normalizedRef.Tenant,
+				subject:  normalizedRef.Subject,
+			}
+		}
+		resolution, err := s.externalOwners.resolve(ctx, principal, normalizedRef, body.RequestID)
+		if err != nil {
+			return spritzv1.SpritzOwner{}, nil, err
+		}
+		owner := body.Spec.Owner
+		owner.ID = resolution.OwnerID
+		body.Spec.Owner = owner
+		return owner, &resolution, nil
+	}
+
+	owner, err := normalizeCreateOwner(body, principal, s.auth.enabled())
+	return owner, nil, err
 }
 
 func validateProvisionerRequestSurface(body *createRequest) error {
@@ -397,8 +506,15 @@ func (s *server) enforceProvisionerQuotas(ctx context.Context, namespace string,
 }
 
 func createRequestFingerprint(body createRequest, namespace, name, namePrefix string, userConfig json.RawMessage) (string, error) {
+	return createRequestFingerprintWithIssuer(body, "", namespace, name, namePrefix, userConfig)
+}
+
+func createRequestFingerprintWithIssuer(body createRequest, externalIssuer, namespace, name, namePrefix string, userConfig json.RawMessage) (string, error) {
 	return createFingerprint(
+		body.OwnerID,
+		body.OwnerRef,
 		body.Spec.Owner.ID,
+		externalIssuer,
 		sanitizeSpritzNameToken(body.PresetID),
 		strings.TrimSpace(name),
 		sanitizeSpritzNameToken(namePrefix),
@@ -409,13 +525,14 @@ func createRequestFingerprint(body createRequest, namespace, name, namePrefix st
 	)
 }
 
-func createResolvedProvisionerPayload(body createRequest, resolvedNamePrefix string) (string, error) {
+func createResolvedProvisionerPayload(body createRequest, resolvedNamePrefix string, resolvedExternalOwner *externalOwnerResolution) (string, error) {
 	payload := idempotentCreatePayload{
-		PresetID:   sanitizeSpritzNameToken(body.PresetID),
-		NamePrefix: sanitizeSpritzNameToken(resolvedNamePrefix),
-		Source:     provisionerSource(&body),
-		RequestID:  strings.TrimSpace(body.RequestID),
-		Spec:       body.Spec,
+		PresetID:      sanitizeSpritzNameToken(body.PresetID),
+		NamePrefix:    sanitizeSpritzNameToken(resolvedNamePrefix),
+		Source:        provisionerSource(&body),
+		RequestID:     strings.TrimSpace(body.RequestID),
+		Spec:          body.Spec,
+		ExternalOwner: newIdempotentExternalOwnerPayload(resolvedExternalOwner),
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -575,7 +692,10 @@ func (s *server) resolvedCreateFingerprint(body createRequest, namespace, explic
 		namePrefix = s.resolvedCreateNamePrefix(body, explicitNamePrefix)
 	}
 	return createFingerprint(
+		body.OwnerID,
+		body.OwnerRef,
 		body.Spec.Owner.ID,
+		"",
 		sanitizeSpritzNameToken(body.PresetID),
 		strings.TrimSpace(body.Name),
 		sanitizeSpritzNameToken(namePrefix),
@@ -586,17 +706,17 @@ func (s *server) resolvedCreateFingerprint(body createRequest, namespace, explic
 	)
 }
 
-func (s *server) provisionerIdempotencyFingerprints(requestBody, resolvedBody createRequest, namespace string, userConfig json.RawMessage) (provisionerIdempotencyState, error) {
+func (s *server) provisionerIdempotencyFingerprints(requestBody, resolvedBody createRequest, resolvedExternalOwner *externalOwnerResolution, externalIssuer, namespace string, userConfig json.RawMessage) (provisionerIdempotencyState, error) {
 	canonicalName := strings.TrimSpace(requestBody.Name)
 	canonicalNamePrefix := ""
 	if canonicalName == "" {
 		canonicalNamePrefix = strings.TrimSpace(requestBody.NamePrefix)
 	}
-	canonicalFingerprint, err := createRequestFingerprint(requestBody, namespace, canonicalName, canonicalNamePrefix, userConfig)
+	canonicalFingerprint, err := createRequestFingerprintWithIssuer(requestBody, externalIssuer, namespace, canonicalName, canonicalNamePrefix, userConfig)
 	if err != nil {
 		return provisionerIdempotencyState{}, err
 	}
-	resolvedPayload, err := createResolvedProvisionerPayload(resolvedBody, s.resolvedCreateNamePrefix(resolvedBody, requestBody.NamePrefix))
+	resolvedPayload, err := createResolvedProvisionerPayload(resolvedBody, s.resolvedCreateNamePrefix(resolvedBody, requestBody.NamePrefix), resolvedExternalOwner)
 	if err != nil {
 		return provisionerIdempotencyState{}, err
 	}
@@ -724,12 +844,17 @@ func hashLabelValue(prefix, value string) string {
 	return fmt.Sprintf("%s-%x", prefix, sum[:12])
 }
 
-func createFingerprint(ownerID, presetID, name, namePrefix, namespace, source string, spec spritzv1.SpritzSpec, userConfig json.RawMessage) (string, error) {
+func createFingerprint(ownerID string, ref *ownerRef, resolvedOwnerID, externalIssuer, presetID, name, namePrefix, namespace, source string, spec spritzv1.SpritzSpec, userConfig json.RawMessage) (string, error) {
 	specCopy := spec
 	specCopy.Annotations = nil
 	specCopy.Labels = nil
+	canonicalOwnerID, ownerPayload, err := canonicalOwnerFingerprintPayload(ownerID, ref, resolvedOwnerID, externalIssuer)
+	if err != nil {
+		return "", err
+	}
 	payload := struct {
-		OwnerID    string              `json:"ownerId"`
+		OwnerID    string              `json:"ownerId,omitempty"`
+		Owner      any                 `json:"owner,omitempty"`
 		PresetID   string              `json:"presetId,omitempty"`
 		Name       string              `json:"name,omitempty"`
 		NamePrefix string              `json:"namePrefix,omitempty"`
@@ -738,7 +863,8 @@ func createFingerprint(ownerID, presetID, name, namePrefix, namespace, source st
 		Spec       spritzv1.SpritzSpec `json:"spec"`
 		UserConfig json.RawMessage     `json:"userConfig,omitempty"`
 	}{
-		OwnerID:    ownerID,
+		OwnerID:    canonicalOwnerID,
+		Owner:      ownerPayload,
 		PresetID:   presetID,
 		Name:       name,
 		NamePrefix: strings.TrimSpace(namePrefix),
@@ -753,6 +879,101 @@ func createFingerprint(ownerID, presetID, name, namePrefix, namespace, source st
 	}
 	sum := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", sum[:]), nil
+}
+
+func canonicalOwnerFingerprintPayload(ownerID string, ref *ownerRef, resolvedOwnerID, externalIssuer string) (string, any, error) {
+	switch {
+	case ref != nil:
+		normalizedType := strings.ToLower(strings.TrimSpace(ref.Type))
+		switch normalizedType {
+		case "owner":
+			if id := strings.TrimSpace(ref.ID); id != "" {
+				return id, nil, nil
+			}
+		case "external":
+			normalized, err := normalizeExternalOwnerRef(*ref)
+			if err != nil {
+				return "", nil, err
+			}
+			payload := canonicalOwnerRefPayload(normalized)
+			if issuer := strings.TrimSpace(externalIssuer); issuer != "" {
+				payload["issuer"] = issuer
+			}
+			return "", payload, nil
+		case "":
+			return "", nil, fmt.Errorf("ownerRef.type is required")
+		default:
+			return "", nil, fmt.Errorf("ownerRef.type must be owner or external")
+		}
+	case strings.TrimSpace(ownerID) != "":
+		return strings.TrimSpace(ownerID), nil, nil
+	}
+
+	if strings.TrimSpace(ownerID) != "" {
+		return strings.TrimSpace(ownerID), nil, nil
+	}
+	return strings.TrimSpace(resolvedOwnerID), nil, nil
+}
+
+func (s *server) externalOwnerIssuerForPrincipal(principal principal) string {
+	if policy, ok := s.externalOwners.policyForPrincipal(principal); ok {
+		return policy.issuer()
+	}
+	return strings.TrimSpace(principal.ID)
+}
+
+func canonicalOwnerRefPayload(ref ownerRef) map[string]string {
+	payload := map[string]string{
+		"type": strings.ToLower(strings.TrimSpace(ref.Type)),
+	}
+	if id := strings.TrimSpace(ref.ID); id != "" {
+		payload["id"] = id
+	}
+	if provider := strings.ToLower(strings.TrimSpace(ref.Provider)); provider != "" {
+		payload["provider"] = provider
+	}
+	if tenant := strings.TrimSpace(ref.Tenant); tenant != "" {
+		payload["tenant"] = tenant
+	}
+	if subject := strings.TrimSpace(ref.Subject); subject != "" {
+		payload["subject"] = subject
+	}
+	return payload
+}
+
+func newIdempotentExternalOwnerPayload(resolution *externalOwnerResolution) *idempotentExternalOwnerPayload {
+	if resolution == nil {
+		return nil
+	}
+	payload := &idempotentExternalOwnerPayload{
+		Issuer:      strings.TrimSpace(resolution.Issuer),
+		Provider:    strings.TrimSpace(resolution.Provider),
+		Tenant:      strings.TrimSpace(resolution.Tenant),
+		SubjectHash: strings.TrimSpace(resolution.SubjectHash),
+	}
+	if !resolution.ResolvedAt.IsZero() {
+		payload.ResolvedAt = resolution.ResolvedAt.UTC().Format(time.RFC3339)
+	}
+	return payload
+}
+
+func (p *idempotentExternalOwnerPayload) resolution() *externalOwnerResolution {
+	if p == nil {
+		return nil
+	}
+	resolution := &externalOwnerResolution{
+		Issuer:      strings.TrimSpace(p.Issuer),
+		Provider:    strings.TrimSpace(p.Provider),
+		Tenant:      strings.TrimSpace(p.Tenant),
+		SubjectHash: strings.TrimSpace(p.SubjectHash),
+	}
+	if strings.TrimSpace(p.ResolvedAt) != "" {
+		parsed, err := time.Parse(time.RFC3339, p.ResolvedAt)
+		if err == nil {
+			resolution.ResolvedAt = parsed.UTC()
+		}
+	}
+	return resolution
 }
 
 func idempotencyReservationName(actorID, key string) string {
@@ -952,6 +1173,15 @@ func matchesIdempotentReplayTarget(spritz *spritzv1.Spritz, principal principal,
 
 func summarizeCreateResponse(spritz *spritzv1.Spritz, principal principal, presetID, source, idempotencyKey string, replayed bool) createSpritzResponse {
 	annotations := spritz.GetAnnotations()
+	responseSpritz := spritz.DeepCopy()
+	ownerID := spritz.Spec.Owner.ID
+	if principal.isService() && hasExternalOwnerAnnotations(annotations) {
+		ownerID = ""
+		responseSpritz.Spec.Owner.ID = ""
+		if responseSpritz.Labels != nil {
+			delete(responseSpritz.Labels, ownerLabelKey)
+		}
+	}
 	if principal.isService() {
 		if storedPresetID := strings.TrimSpace(annotations[presetIDAnnotationKey]); storedPresetID != "" {
 			presetID = storedPresetID
@@ -968,12 +1198,12 @@ func summarizeCreateResponse(spritz *spritzv1.Spritz, principal principal, prese
 	workspaceURL := spritzv1.WorkspaceURLForSpritz(spritz)
 	chatURL := spritzv1.ChatURLForSpritz(spritz)
 	return createSpritzResponse{
-		Spritz:         spritz,
+		Spritz:         responseSpritz,
 		AccessURL:      spritzv1.AccessURLForSpritz(spritz),
 		ChatURL:        chatURL,
 		WorkspaceURL:   workspaceURL,
 		Namespace:      spritz.Namespace,
-		OwnerID:        spritz.Spec.Owner.ID,
+		OwnerID:        ownerID,
 		ActorID:        principal.ID,
 		ActorType:      string(principal.Type),
 		PresetID:       presetID,
@@ -987,6 +1217,15 @@ func summarizeCreateResponse(spritz *spritzv1.Spritz, principal principal, prese
 		MaxExpiresAt:   maxExpiresAt,
 		ExpiresAt:      expiresAt,
 	}
+}
+
+func hasExternalOwnerAnnotations(annotations map[string]string) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+	return strings.TrimSpace(annotations[externalOwnerIssuerAnnotationKey]) != "" &&
+		strings.TrimSpace(annotations[externalOwnerProviderAnnotationKey]) != "" &&
+		strings.TrimSpace(annotations[externalOwnerSubjectHashAnnotationKey]) != ""
 }
 
 func lifecycleExpiryTimes(spritz *spritzv1.Spritz, _ time.Time) (*metav1.Time, *metav1.Time, *metav1.Time) {
