@@ -16,9 +16,9 @@ paste a Spritz-specific owner ID.
 
 Typical examples include:
 
-- a Discord bot,
-- a Slack app,
 - a Microsoft Teams assistant,
+- a Slack app,
+- a Discord bot,
 - a Google Chat integration,
 - a Mattermost automation.
 
@@ -42,8 +42,8 @@ and the portable auth model defined in
   action-specific API.
 - Require explicit human confirmation before an external identity is bound to a
   Spritz owner.
-- Keep the create/provision flow stable across Discord, Slack, Teams, and
-  future providers.
+- Keep the create/provision flow stable across Microsoft Teams, Slack,
+  Discord, and future providers.
 - Align the identity model with widely used federation concepts such as
   issuer-plus-subject identifiers.
 - Preserve current explicit ownership and lifecycle guarantees.
@@ -55,7 +55,8 @@ and the portable auth model defined in
 - Letting service principals search arbitrary users by email, name, or handle.
 - Letting an external system claim a user account without a human confirmation
   step.
-- Embedding Discord-, Slack-, or deployment-specific logic in Spritz core.
+- Embedding Microsoft Teams-, Slack-, or deployment-specific logic in Spritz
+  core.
 - Requiring a provider-specific verification protocol in the core API.
 
 ## Design Principles
@@ -96,8 +97,8 @@ The stable API should keep linking explicit so that:
 
 ### Providers stay pluggable
 
-Spritz should not require Discord-specific or Slack-specific fields in canonical
-records.
+Spritz should not require Microsoft Teams-specific or Slack-specific fields in
+canonical records.
 
 Provider-specific metadata should remain optional, opaque, and advisory.
 
@@ -130,8 +131,8 @@ This is the same owner model used by existing UI and provisioner flows.
 An external identity is an opaque tuple:
 
 - `issuer`: the namespace that controls the identity binding authority,
-- `provider`: the external system category such as `discord`, `slack`, or
-  `teams`,
+- `provider`: the external system category such as `msteams`, `slack`, or
+  `discord`,
 - `subject`: the stable provider-specific user identifier.
 
 ### External identity link
@@ -157,8 +158,8 @@ The identity tuple is:
 ```json
 {
   "issuer": "support-bot",
-  "provider": "discord",
-  "subject": "123456789012345678"
+  "provider": "msteams",
+  "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
 }
 ```
 
@@ -183,8 +184,8 @@ resolving identities in another integration's namespace.
 ```json
 {
   "issuer": "support-bot",
-  "provider": "discord",
-  "subject": "123456789012345678"
+  "provider": "msteams",
+  "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
 }
 ```
 
@@ -203,8 +204,8 @@ or
 {
   "type": "external",
   "issuer": "support-bot",
-  "provider": "discord",
-  "subject": "123456789012345678"
+  "provider": "msteams",
+  "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
 }
 ```
 
@@ -217,8 +218,8 @@ Recommended response shape:
   "id": "eil_01j...",
   "identity": {
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   },
   "ownerId": "user-123",
   "status": "active",
@@ -240,8 +241,8 @@ Recommended response shape:
   "id": "eili_01j...",
   "identity": {
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   },
   "status": "pending",
   "claimUrl": "https://spritz.example.com/link/eili_01j.../claim",
@@ -266,8 +267,8 @@ Request:
 {
   "identity": {
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   }
 }
 ```
@@ -307,15 +308,15 @@ Request:
 {
   "identity": {
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   },
   "metadata": {
     "displayName": "onur"
   },
   "ttl": "15m",
   "requireUserCode": true,
-  "clientState": "discord-interaction-123"
+  "clientState": "msteams-turn-context-123"
 }
 ```
 
@@ -412,11 +413,11 @@ Recommended request:
   "ownerRef": {
     "type": "external",
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   },
   "presetId": "openclaw",
-  "idempotencyKey": "discord-123"
+  "idempotencyKey": "msteams-123"
 }
 ```
 
@@ -435,8 +436,8 @@ Recommended typed error:
   "error": "external_identity_unlinked",
   "identity": {
     "issuer": "support-bot",
-    "provider": "discord",
-    "subject": "123456789012345678"
+    "provider": "msteams",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
   }
 }
 ```
