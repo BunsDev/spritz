@@ -1,0 +1,421 @@
+---
+date: 2026-03-12
+author: Spritz Maintainers <user@example.com>
+title: External Identity Resolution API Architecture
+tags: [spritz, auth, provisioning, identity, api, architecture]
+---
+
+## Overview
+
+This document defines the long-term stable Spritz architecture for resolving an
+external identity to a Spritz owner during provisioning.
+
+In this model, Spritz does not own account linking. Spritz consumes an external
+identity resolver that is already authoritative for mappings such as:
+
+- Microsoft Teams user -> product user
+- Slack user -> product user
+- Discord user -> product user
+
+Spritz stays provider-agnostic and product-agnostic. It accepts a normalized
+external owner reference, derives the caller namespace from authentication, and
+asks a configured resolver which Spritz owner should own the workspace.
+
+This architecture extends the external provisioner model defined in
+[2026-03-11-external-provisioner-and-service-principal-architecture.md](2026-03-11-external-provisioner-and-service-principal-architecture.md)
+and the portable auth model defined in
+[2026-02-24-portable-authentication-and-account-architecture.md](2026-02-24-portable-authentication-and-account-architecture.md).
+
+## Goals
+
+- Let external systems provision for a human without exposing manual owner-ID
+  lookup UX.
+- Keep Spritz core portable and free of product-specific account-linking logic.
+- Make the public create API stable across Microsoft Teams, Slack, Discord, and
+  future providers.
+- Keep ownership resolution narrow, explicit, auditable, and deterministic.
+- Avoid leaking internal owner IDs to external bots when they do not need them.
+- Support enterprise providers where identity is tenant-scoped.
+
+## Non-goals
+
+- Turning Spritz into a general identity provider.
+- Making Spritz the source of truth for account linking.
+- Adding browser claim flows, link intents, or user-entered verification codes
+  to Spritz core.
+- Letting service principals search users by email, display name, or handle.
+- Embedding Microsoft Teams-specific or deployment-specific mapping logic in
+  Spritz core.
+
+## Design Principles
+
+### Spritz resolves, but does not link
+
+Spritz is a consumer of authoritative identity mappings, not the owner of those
+mappings.
+
+If a deployment already knows which external user belongs to which product
+account, Spritz should ask that system directly instead of recreating a second
+linking database.
+
+### Caller namespace comes from authentication
+
+The integration namespace is derived from the authenticated service principal.
+
+The caller must not be allowed to spoof namespace selection by sending an
+arbitrary `issuer` value in the request body.
+
+### External identity is opaque and provider-scoped
+
+Spritz treats provider user IDs as opaque strings.
+
+Canonicalization belongs to the provider adapter or external resolver, not to
+Spritz core.
+
+### Enterprise providers need tenant scope
+
+For enterprise messaging systems, a provider user ID is often not globally
+meaningful without tenant context.
+
+The public API must support an explicit tenant or realm field.
+
+### Create is the main contract
+
+The stable public contract should center on create-time owner resolution.
+
+Spritz may expose operational debug endpoints later, but the main integration
+surface is still `POST /spritzes`.
+
+## Canonical Terms
+
+### Spritz owner
+
+The human principal that owns and later accesses a workspace.
+
+### External owner reference
+
+A provider-scoped, product-agnostic reference to a human in an external
+messaging or workflow system.
+
+### Resolver namespace
+
+The namespace bound to the authenticated service principal. It tells Spritz
+which external resolver configuration to use.
+
+### External identity resolver
+
+A deployment-owned authoritative system that maps an external owner reference
+to a Spritz owner.
+
+## Core Model
+
+The public owner reference should support either a direct owner ID or an
+external identity:
+
+```json
+{
+  "type": "owner",
+  "id": "user-123"
+}
+```
+
+or
+
+```json
+{
+  "type": "external",
+  "provider": "msteams",
+  "tenant": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+  "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
+}
+```
+
+Rules:
+
+- `type` MUST be either `owner` or `external`.
+- `provider` MUST be a normalized lower-case token.
+- `subject` MUST be treated as an opaque string.
+- `tenant` MAY be omitted only for providers where the subject is globally
+  stable without tenant scope.
+- For `msteams`, `tenant` SHOULD be required by policy.
+- The effective identity key inside Spritz is:
+  `resolverNamespace + provider + tenant + subject`
+- `resolverNamespace` is derived from the authenticated service principal, not
+  from request payload.
+
+## High-Level Architecture
+
+Components:
+
+- external bot or automation
+- Spritz API
+- resolver configuration bound to the service principal
+- deployment-owned external identity resolver
+
+Flow:
+
+1. The bot calls `POST /spritzes` with `ownerRef.type=external`.
+2. Spritz authenticates the service principal.
+3. Spritz derives the resolver namespace from that principal.
+4. Spritz validates that the provider and tenant are allowed for that namespace.
+5. Spritz calls the configured external resolver.
+6. The resolver returns either `resolved`, `unresolved`, `forbidden`, or
+   `ambiguous`.
+7. Spritz either provisions for the resolved owner or returns a typed error.
+
+## Stable Public API
+
+The create API should add `ownerRef` while preserving existing `ownerId`
+compatibility.
+
+Recommended request:
+
+```json
+{
+  "ownerRef": {
+    "type": "external",
+    "provider": "msteams",
+    "tenant": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
+  },
+  "presetId": "openclaw",
+  "idempotencyKey": "msteams-123"
+}
+```
+
+Rules:
+
+- `ownerId` and `ownerRef` MUST be mutually exclusive.
+- If `ownerRef.type=owner`, Spritz uses the explicit owner ID.
+- If `ownerRef.type=external`, Spritz MUST resolve the owner through the
+  configured resolver before create.
+- Create MUST NOT require the caller to know the internal owner ID.
+- The caller MUST NOT provide `resolverNamespace` or `issuer` in the request
+  body.
+- Spritz MUST use the resolver namespace bound to the authenticated principal.
+
+## External Resolver Contract
+
+Spritz core should define an internal resolver interface:
+
+- `ResolveExternalOwner(ctx, namespace, identity) -> result`
+
+Recommended canonical result states:
+
+- `resolved`
+- `unresolved`
+- `forbidden`
+- `ambiguous`
+- `unavailable`
+
+For HTTP-backed deployments, a portable resolver API can look like this:
+
+`POST /v1/external-owners/resolve`
+
+Request:
+
+```json
+{
+  "namespace": "support-bot",
+  "identity": {
+    "provider": "msteams",
+    "tenant": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
+  },
+  "requestId": "req_01j..."
+}
+```
+
+Response when resolved:
+
+```json
+{
+  "status": "resolved",
+  "ownerId": "user-123"
+}
+```
+
+Response when unresolved:
+
+```json
+{
+  "status": "unresolved"
+}
+```
+
+Response when forbidden:
+
+```json
+{
+  "status": "forbidden"
+}
+```
+
+Response when ambiguous:
+
+```json
+{
+  "status": "ambiguous"
+}
+```
+
+Properties:
+
+- The resolver MUST return at most one owner.
+- The resolver MUST NOT perform fuzzy matching by email, name, or handle.
+- The resolver is the source of truth for external-to-owner mappings.
+- Spritz MAY cache results briefly, but the resolver remains authoritative.
+
+## Public Error Model
+
+When create is called with `ownerRef.type=external`, Spritz should return typed
+errors rather than leaking resolver internals.
+
+Recommended errors:
+
+- `external_identity_unresolved`
+- `external_identity_forbidden`
+- `external_identity_ambiguous`
+- `external_identity_provider_unsupported`
+- `external_identity_resolution_unavailable`
+
+Recommended unresolved example:
+
+```json
+{
+  "error": "external_identity_unresolved",
+  "identity": {
+    "provider": "msteams",
+    "tenant": "72f988bf-86f1-41af-91ab-2d7cd011db47",
+    "subject": "29:1A2BcD3EfG4HiJ5KlM6NoP"
+  }
+}
+```
+
+Recommended status semantics:
+
+- `external_identity_unresolved`: `409`
+- `external_identity_forbidden`: `403`
+- `external_identity_ambiguous`: `409`
+- `external_identity_provider_unsupported`: `400`
+- `external_identity_resolution_unavailable`: `503`
+
+## Authorization Model
+
+Recommended service capabilities:
+
+- `spritz.external_identities.resolve_via_create`
+
+Optional future capability:
+
+- `spritz.external_identities.check`
+
+Rules:
+
+- Resolver namespace MUST be bound to the authenticated service principal.
+- A service principal MUST be allowed to resolve only within its own namespace
+  unless explicitly granted broader authority.
+- Provider allowlists and tenant allowlists SHOULD be policy-controlled per
+  namespace.
+
+## Caching and Consistency
+
+Spritz should treat the external resolver as the source of truth.
+
+Safe default behavior:
+
+- no durable copy of identity mappings in Spritz core
+- optional short positive cache
+- optional shorter negative cache
+- cache key includes namespace, provider, tenant, and subject
+
+If a mapping changes in the external system, future creates should follow the
+new resolver answer after cache expiry.
+
+Existing workspaces keep their existing owner. Resolution affects only future
+create operations.
+
+## Microsoft Teams Guidance
+
+The first concrete provider should be `msteams`.
+
+Provider guidance:
+
+- `provider` value: `msteams`
+- `tenant` SHOULD be the Microsoft tenant identifier and SHOULD be required by
+  policy
+- `subject` MUST be the stable Teams user identifier chosen by the deployment's
+  Teams integration
+
+Spritz core should not attempt to normalize Teams identifiers itself. The Teams
+adapter or authoritative resolver must choose one canonical subject format and
+keep it consistent.
+
+## Optional Future Extension
+
+If a deployment later wants lower latency or fewer synchronous dependencies, it
+may add a signed owner assertion flow on top of this architecture.
+
+That would allow a trusted external resolver to mint a short-lived signed
+assertion that Spritz can verify locally during create.
+
+This is an extension, not part of the stable v1 contract. The stable core
+contract should remain synchronous external resolution through a configured
+resolver.
+
+## Backward Compatibility
+
+The stable migration path is:
+
+1. Keep `ownerId` as-is.
+2. Add `ownerRef`.
+3. Add resolver-backed handling for `ownerRef.type=external`.
+4. Keep direct owner-ID creates for existing clients.
+
+This avoids a breaking change to current provisioner clients while giving new
+integrations a portable path that does not require manual owner-ID exchange.
+
+## Validation
+
+The architecture is complete when Spritz can demonstrate all of these flows:
+
+1. A service principal provisions successfully with `ownerRef.type=external`
+   for a resolved Microsoft Teams user.
+2. An unresolved external identity fails with `external_identity_unresolved`.
+3. A forbidden namespace or provider fails with `external_identity_forbidden`.
+4. An ambiguous resolver answer fails with `external_identity_ambiguous`.
+5. A resolver outage fails with `external_identity_resolution_unavailable`.
+6. A positive cache hit still provisions for the same owner.
+7. A mapping change in the external resolver affects future creates after cache
+   expiry.
+
+## Recommended Sequencing
+
+### Phase 1 - Public API and internal abstraction
+
+- Add `ownerRef` to create requests.
+- Derive resolver namespace from authenticated service principal.
+- Define the internal resolver interface and typed result states.
+
+### Phase 2 - Resolver-backed provisioning
+
+- Implement the HTTP resolver adapter.
+- Add provider and tenant policy validation.
+- Add typed create-time error mapping.
+
+### Phase 3 - Reliability and observability
+
+- Add short TTL caching.
+- Add metrics and structured audit logs for resolution attempts.
+- Add timeout, retry, and circuit-breaker policy.
+
+### Phase 4 - Optional assertion-based optimization
+
+- Add signed owner assertions only if synchronous resolution becomes a proven
+  bottleneck.
+- Keep the public `ownerRef` contract unchanged.
+
+## References
+
+- [2026-03-11-external-provisioner-and-service-principal-architecture.md](2026-03-11-external-provisioner-and-service-principal-architecture.md)
+- [2026-02-24-portable-authentication-and-account-architecture.md](2026-02-24-portable-authentication-and-account-architecture.md)
