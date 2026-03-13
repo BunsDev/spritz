@@ -1,6 +1,13 @@
+---
+date: 2026-03-13
+author: Onur Solmaz <onur@textcortex.com>
+title: OpenClaw Integration
+tags: [openclaw, acp, integration]
+---
+
 # OpenClaw in Spritz
 
-This file is the single source of truth for OpenClaw-related behavior in this repository.
+This document is the single source of truth for OpenClaw-related behavior in this repository.
 
 ## Scope
 
@@ -9,7 +16,7 @@ Each devbox runs its own OpenClaw process and is opened through its own `/w/{nam
 When OpenClaw is used as an ACP backend inside Spritz, it should also expose ACP on
 the reserved internal port `2529`.
 
-## Where OpenClaw Lives in This Repo
+## Where OpenClaw lives in this repo
 
 - Image and runtime wrapper:
   - `images/examples/openclaw/Dockerfile`
@@ -21,7 +28,7 @@ the reserved internal port `2529`.
   - `helm/spritz/values.yaml` (`ui.presets`)
   - `helm/spritz/templates/ui-deployment.yaml`
 
-## Runtime Contract (Example Image)
+## Runtime contract (example image)
 
 The OpenClaw example entrypoint does the following:
 
@@ -48,7 +55,7 @@ The OpenClaw example entrypoint does the following:
 
 Key implication: direct `/w/{name}` access with `bind=lan` expects real gateway auth.
 
-## ACP Contract In Spritz
+## ACP contract in Spritz
 
 Spritz treats ACP as backend-agnostic.
 
@@ -69,7 +76,7 @@ Today the example image satisfies that contract with a long-lived ACP adapter:
 
 - one long-lived Node ACP server inside the image listens on `2529`
 - the adapter talks to the local OpenClaw gateway over loopback WebSocket
-- ACP websocket clients connect to that long-lived adapter instead of spawning a fresh runtime
+- ACP WebSocket clients connect to that long-lived adapter instead of spawning a fresh runtime
 - the adapter also exposes cheap HTTP health and metadata endpoints for Spritz operator discovery
 - if gateway auth mode is `trusted-proxy`, the adapter uses a loopback-only header injector so the
   internal ACP hop satisfies the same trusted-proxy contract as the browser route
@@ -79,7 +86,7 @@ Today the example image satisfies that contract with a long-lived ACP adapter:
 This keeps the Spritz side backend-agnostic while OpenClaw remains free to add native socket ACP
 later.
 
-## Auth Modes and What to Use
+## Auth modes and what to use
 
 ### `token` (default-safe for current direct routing)
 
@@ -108,7 +115,7 @@ Required platform behavior:
 - `auth.mode=none` with `bind=lan` is rejected by OpenClaw runtime checks.
 - Use `none` only for trusted local/loopback scenarios.
 
-## Tokenless Implementation Pattern (Recommended)
+## Tokenless implementation pattern (recommended)
 
 If the target is "no token prompt in Control UI":
 
@@ -120,7 +127,7 @@ If the target is "no token prompt in Control UI":
 
 Do not disable auth globally to get tokenless behavior.
 
-## Example Preset Snippet
+## Example preset snippet
 
 Use `ui.presets` to ship an OpenClaw preset with config injected through env:
 
@@ -138,7 +145,7 @@ ui:
 
 For trusted-proxy deployments, replace the `auth` block accordingly.
 
-## Fast Troubleshooting
+## Fast troubleshooting
 
 - `Refusing to bind gateway to lan without auth`:
   - invalid config (typically `auth.mode=none` with `bind=lan`).
@@ -148,8 +155,8 @@ For trusted-proxy deployments, replace the `auth` block accordingly.
 - `origin not allowed`:
   - add the dashboard origin to `gateway.controlUi.allowedOrigins`.
 
-## Related Docs
+## Related docs
 
-- `images/examples/openclaw/README.md`
-- `docs/2026-02-24-simplest-spritz-deployment-spec.md`
-- `docs/2026-02-24-portable-authentication-and-account-architecture.md`
+- [OpenClaw example runtime README](../images/examples/openclaw/README.md)
+- [Simplest Spritz Deployment Spec](2026-02-24-simplest-spritz-deployment-spec.md)
+- [Portable Authentication and Account Architecture](2026-02-24-portable-authentication-and-account-architecture.md)

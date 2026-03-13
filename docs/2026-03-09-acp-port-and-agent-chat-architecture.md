@@ -204,6 +204,6 @@ A deployment is considered correct when all of these are true:
 ## References
 
 - `README.md`
-- `OPENCLAW.md`
+- [OpenClaw Integration](2026-03-13-openclaw-integration.md)
 - `docs/2026-03-10-acp-adapter-and-runtime-target-architecture.md`
 - `docs/2026-02-24-simplest-spritz-deployment-spec.md`

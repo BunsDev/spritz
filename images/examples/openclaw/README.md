@@ -3,7 +3,7 @@
 This image provides a generic Spritz devbox with `openclaw` preinstalled.
 
 For the repository-level OpenClaw integration model (auth modes, routing expectations,
-and production tokenless pattern), see `OPENCLAW.md`.
+and production tokenless pattern), see [OpenClaw Integration](../../../docs/2026-03-13-openclaw-integration.md).
 
 It intentionally stays environment-agnostic:
 
