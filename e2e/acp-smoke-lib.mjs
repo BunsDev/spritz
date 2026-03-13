@@ -229,8 +229,13 @@ export function resolveACPEndpoint(spritz) {
 /**
  * Load a Node-compatible WebSocket client constructor from the CLI dependency set.
  */
-export function resolveWebSocketConstructor() {
-  const wsModule = cliRequire('ws');
+export function resolveWebSocketConstructor(options = {}) {
+  const globalObject = options.globalObject ?? globalThis;
+  if (typeof globalObject?.WebSocket === 'function') {
+    return globalObject.WebSocket;
+  }
+  const requireFn = options.requireFn ?? cliRequire;
+  const wsModule = requireFn('ws');
   return wsModule.WebSocket || wsModule.default || wsModule;
 }
 
