@@ -29,7 +29,7 @@
       availableCommands: [],
       currentMode: '',
       usage: null,
-      thinkingChunks: [] as Array<{ kind: 'thought' | 'tool' | 'done'; text: string; url?: string; toolKind?: 'fetch' | 'search'; _toolCallId?: string }>,
+      thinkingChunks: [] as Array<{ kind: 'thought' | 'tool' | 'done'; text: string; url?: string; toolKind?: 'fetch' | 'search' | 'generic'; _toolCallId?: string; toolName?: string; status?: string; input?: string; result?: string }>,
       thinkingActive: false,
       thinkingInsertIndex: 0,
       thinkingStartTime: 0,
@@ -380,9 +380,7 @@
     transcript.thinkingActive = false;
     // Bake the completed thinking block into the message list so it persists
     // after the next turn resets thinkingChunks.
-    // Only bake if there were web tool calls — skip if only non-web tools/thoughts.
-    const hasWebTools = transcript.thinkingChunks.some((c) => c.kind === 'tool' && c.toolKind);
-    if (transcript.thinkingChunks.length > 0 && hasWebTools) {
+    if (transcript.thinkingChunks.length > 0) {
       const seconds = transcript.thinkingElapsedSeconds || 0;
       const insertIdx = transcript.thinkingInsertIndex || transcript.messages.length;
       const thinkingMessage = {
@@ -399,8 +397,7 @@
 
   /** Bake any leftover thinking chunks after historical replay ends. */
   function finalizeHistoricalThinking(transcript) {
-    const hasWebTools = transcript.thinkingChunks.some((c) => c.kind === 'tool' && c.toolKind);
-    if (transcript.thinkingChunks.length > 0 && hasWebTools) {
+    if (transcript.thinkingChunks.length > 0) {
       const insertIdx = transcript.thinkingInsertIndex || transcript.messages.length;
       transcript.messages.splice(insertIdx, 0, {
         type: 'thinking_done' as const,
@@ -500,6 +497,9 @@
   ) {
     const type = update?.sessionUpdate || 'unknown';
     const historical = Boolean(options.historical);
+    if (type === 'tool_call' || type === 'tool_call_update') {
+      console.log('[ACP Debug] tool event received:', type, JSON.stringify(update).slice(0, 200));
+    }
     if (type === 'user_message_chunk') {
       const text = extractACPText(update.content);
       if (/^\s*<(?:command-name|command-message|command-args|local-command-stdout)\b/i.test(text)) {
@@ -514,18 +514,15 @@
           },
         };
       }
-      // Bake any accumulated historical thinking from the previous turn (only if web tools used)
+      // Bake any accumulated historical thinking from the previous turn
       if (historical && transcript.thinkingChunks.length > 0) {
-        const hadWebTools = transcript.thinkingChunks.some((c) => c.kind === 'tool' && c.toolKind);
-        if (hadWebTools) {
-          const insertIdx = transcript.thinkingInsertIndex || transcript.messages.length;
-          transcript.messages.splice(insertIdx, 0, {
-            type: 'thinking_done' as const,
-            seconds: 0,
-            chunks: transcript.thinkingChunks.slice(),
-          });
-          rebuildToolCallIndex(transcript);
-        }
+        const insertIdx = transcript.thinkingInsertIndex || transcript.messages.length;
+        transcript.messages.splice(insertIdx, 0, {
+          type: 'thinking_done' as const,
+          seconds: 0,
+          chunks: transcript.thinkingChunks.slice(),
+        });
+        rebuildToolCallIndex(transcript);
       }
       // Reset thinking state for the new turn
       transcript.thinkingChunks = [];
@@ -533,7 +530,6 @@
       transcript.thinkingInsertIndex = 0;
       transcript.thinkingStartTime = 0;
       transcript.thinkingElapsedSeconds = 0;
-
       if (historical) {
         appendHistoricalText(
           transcript,
@@ -594,34 +590,58 @@
       return null;
     }
     if (type === 'tool_call' || type === 'tool_call_update') {
-      const toolCallId = update.toolCallId || '';
-      if (type === 'tool_call') {
-        const toolTitle = update.title || '';
-        if (!transcript.thinkingActive && !transcript.thinkingChunks.length) {
-          transcript.thinkingInsertIndex = transcript.messages.length;
-          if (!historical) transcript.thinkingStartTime = transcript.thinkingStartTime || Date.now();
-        }
-        if (!historical) transcript.thinkingActive = true;
-        // Detect web tools via _meta.claudeCode.toolName
-        const realToolName = (update._meta?.claudeCode?.toolName || '').toLowerCase();
-        const isSearch = realToolName === 'websearch';
-        const isFetch = realToolName === 'webfetch';
-        const toolKind = isSearch ? 'search' as const : isFetch ? 'fetch' as const : undefined;
-        const url = (extractToolUrl(update) || '') || undefined;
-        const displayText = toolTitle.replace(/^"|"$/g, '').trim();
-        transcript.thinkingChunks.push({ kind: 'tool', text: displayText || realToolName, url, toolKind, _toolCallId: toolCallId });
+      // Initialize thinking state if needed
+      if (!transcript.thinkingActive && !transcript.thinkingChunks.length) {
+        transcript.thinkingInsertIndex = transcript.messages.length;
+        if (!historical) transcript.thinkingStartTime = Date.now();
       }
-      // Update existing chunk with URL/title from tool_call_update
-      if (type === 'tool_call_update' && toolCallId) {
-        const existing = transcript.thinkingChunks.find((c) => c._toolCallId === toolCallId);
-        if (existing && existing.toolKind) {
-          const newUrl = extractToolUrl(update) || '';
-          if (newUrl && !existing.url) existing.url = newUrl;
-          const newTitle = (update.title || '').replace(/^"|"$/g, '').trim();
-          if (newTitle && newTitle !== 'undefined' && (!existing.text || existing.text === 'undefined')) {
-            existing.text = newTitle;
-          }
-        }
+      if (!historical) transcript.thinkingActive = true;
+
+      const toolCallId = update.toolCallId || createId('tool');
+      const toolName = update.name || update.title || update.type || 'Tool call';
+      const status = update.status || 'pending';
+      const inputText = stringifyDetails(update.rawInput);
+      const normalizedResult = normalizeToolResultText(update.rawOutput);
+      const resultText = normalizedResult.text;
+      const url = extractToolUrl(update);
+
+      // Classify tool kind by name
+      const nameLower = (toolName || '').toLowerCase().replace(/[-_]/g, '');
+      let toolKind: 'fetch' | 'search' | 'generic' = 'generic';
+      if (/search|query|grep|glob|find/.test(nameLower)) toolKind = 'search';
+      else if (/fetch|browse|readpage|navigate|webfetch/.test(nameLower)) toolKind = 'fetch';
+
+      // Upsert into thinkingChunks
+      const existing = transcript.thinkingChunks.find((c) => c._toolCallId === toolCallId);
+      if (existing) {
+        existing.status = status;
+        if (update.name || update.title) existing.toolName = toolName;
+        if (inputText) existing.input = inputText;
+        if (resultText) existing.result = resultText;
+        if (url) existing.url = url;
+        existing.text = url || existing.toolName || toolName;
+      } else {
+        transcript.thinkingChunks.push({
+          kind: 'tool',
+          toolKind,
+          _toolCallId: toolCallId,
+          toolName,
+          status,
+          text: url || toolName,
+          url: url || undefined,
+          input: inputText || undefined,
+          result: resultText || undefined,
+        });
+      }
+
+      // Toast on error
+      if (!historical && normalizedResult.isError && normalizedResult.text) {
+        return {
+          toast: {
+            type: 'error',
+            message: normalizedResult.text,
+          },
+        };
       }
       return null;
     }
@@ -1347,95 +1367,201 @@
     catch { return url; }
   }
 
+  const TOOL_ICON =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>';
+
   /** Build grouped timeline DOM nodes from thinking chunks. */
   function buildGroupedTimeline(chunks, showFinished) {
     const fragment = document.createDocumentFragment();
-    const searchPills: Array<{ text: string }> = [];
-    const fetchSources: Array<{ url: string; domain: string }> = [];
 
-    // Collect web tool data — skip thoughts and non-web tools
-    for (const chunk of chunks) {
-      if (chunk.kind !== 'tool') continue;
-      if (!chunk.toolKind) continue;
-      const cleanText = (chunk.text || '').replace(/^"|"$/g, '').trim();
-      if (chunk.toolKind === 'fetch') {
-        if (chunk.url) {
-          fetchSources.push({ url: chunk.url, domain: extractDomain(chunk.url) });
+    // Process chunks in order, grouping consecutive same-kind web tools
+    let i = 0;
+    while (i < chunks.length) {
+      const chunk = chunks[i];
+
+      // Thought step — collapsible when text exceeds 120 chars
+      if (chunk.kind === 'thought') {
+        if (!chunk.text) { i++; continue; }
+        const step = document.createElement('div');
+        step.className = 'acp-tl-step acp-tl-step--thought';
+        const dot = document.createElement('div');
+        dot.className = 'acp-tl-dot';
+        const content = document.createElement('div');
+        content.className = 'acp-tl-content';
+        if (chunk.text.length > 120) {
+          const details = document.createElement('details');
+          details.className = 'acp-tl-thought-details';
+          const summary = document.createElement('summary');
+          summary.className = 'acp-tl-thought-text';
+          summary.textContent = excerpt(chunk.text, 120);
+          details.appendChild(summary);
+          const full = document.createElement('div');
+          full.className = 'acp-tl-thought-full';
+          full.textContent = chunk.text;
+          details.appendChild(full);
+          content.appendChild(details);
+        } else {
+          const text = document.createElement('span');
+          text.className = 'acp-tl-thought-text';
+          text.textContent = chunk.text;
+          content.appendChild(text);
         }
-        const pillText = chunk.url ? extractDomain(chunk.url) : cleanText;
-        if (pillText && pillText !== 'undefined') searchPills.push({ text: pillText });
-      } else if (chunk.toolKind === 'search') {
-        const pillText = chunk.url || cleanText;
-        if (pillText && pillText !== 'undefined') searchPills.push({ text: pillText });
+        step.append(dot, content);
+        fragment.appendChild(step);
+        i++; continue;
       }
-    }
 
-    // "Searching" step with grouped pills
-    if (searchPills.length > 0) {
+      if (chunk.kind !== 'tool') { i++; continue; }
+
+      // Group consecutive search chunks
+      if (chunk.toolKind === 'search') {
+        const searchPills: Array<{ text: string }> = [];
+        while (i < chunks.length && chunks[i].kind === 'tool' && chunks[i].toolKind === 'search') {
+          const c = chunks[i];
+          const cleanText = (c.text || '').replace(/^"|"$/g, '').trim();
+          const pillText = c.url || cleanText;
+          if (pillText && pillText !== 'undefined') searchPills.push({ text: pillText });
+          i++;
+        }
+        if (searchPills.length > 0) {
+          const step = document.createElement('div');
+          step.className = 'acp-tl-step acp-tl-step--tool';
+          const dot = document.createElement('div');
+          dot.className = 'acp-tl-dot';
+          const content = document.createElement('div');
+          content.className = 'acp-tl-content';
+          const label = document.createElement('span');
+          label.className = 'acp-tl-group-label';
+          label.textContent = 'Searching';
+          content.appendChild(label);
+          const pillRow = document.createElement('div');
+          pillRow.className = 'acp-tl-pill-row';
+          for (const item of searchPills) {
+            const pill = document.createElement('span');
+            pill.className = 'acp-tl-search-pill';
+            pill.innerHTML = SEARCH_ICON;
+            const pillText = document.createElement('span');
+            pillText.textContent = item.text;
+            pill.appendChild(pillText);
+            pillRow.appendChild(pill);
+          }
+          content.appendChild(pillRow);
+          step.append(dot, content);
+          fragment.appendChild(step);
+        }
+        continue;
+      }
+
+      // Group consecutive fetch chunks
+      if (chunk.toolKind === 'fetch') {
+        const fetchSources: Array<{ url: string; domain: string }> = [];
+        while (i < chunks.length && chunks[i].kind === 'tool' && chunks[i].toolKind === 'fetch') {
+          const c = chunks[i];
+          if (c.url) {
+            fetchSources.push({ url: c.url, domain: extractDomain(c.url) });
+          }
+          i++;
+        }
+        if (fetchSources.length > 0) {
+          const step = document.createElement('div');
+          step.className = 'acp-tl-step acp-tl-step--sources';
+          const dot = document.createElement('div');
+          dot.className = 'acp-tl-dot';
+          const content = document.createElement('div');
+          content.className = 'acp-tl-content';
+          const label = document.createElement('span');
+          label.className = 'acp-tl-group-label';
+          label.textContent = 'Reviewing sources';
+          content.appendChild(label);
+          const sourceList = document.createElement('div');
+          sourceList.className = 'acp-tl-source-list';
+          for (const src of fetchSources) {
+            const row = document.createElement('div');
+            row.className = 'acp-tl-source-row';
+            const favicon = document.createElement('img');
+            favicon.className = 'acp-tl-source-favicon';
+            favicon.src = `https://www.google.com/s2/favicons?domain=${src.domain}&sz=32`;
+            favicon.alt = '';
+            favicon.width = 16;
+            favicon.height = 16;
+            const link = document.createElement('a');
+            link.className = 'acp-tl-source-link';
+            link.href = src.url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = src.url;
+            const domainEl = document.createElement('span');
+            domainEl.className = 'acp-tl-source-domain';
+            domainEl.textContent = src.domain;
+            row.append(favicon, link, domainEl);
+            sourceList.appendChild(row);
+          }
+          content.appendChild(sourceList);
+          step.append(dot, content);
+          fragment.appendChild(step);
+        }
+        continue;
+      }
+
+      // Generic tool — name, status, collapsible details
+      const statusClass = chunk.status === 'completed' ? 'acp-tl-step--completed'
+        : chunk.status === 'failed' ? 'acp-tl-step--failed'
+        : 'acp-tl-step--pending';
       const step = document.createElement('div');
-      step.className = 'acp-tl-step acp-tl-step--tool';
+      step.className = `acp-tl-step acp-tl-step--generic ${statusClass}`;
       const dot = document.createElement('div');
       dot.className = 'acp-tl-dot';
       const content = document.createElement('div');
       content.className = 'acp-tl-content';
-      const label = document.createElement('span');
-      label.className = 'acp-tl-group-label';
-      label.textContent = 'Searching';
-      content.appendChild(label);
-      const pillRow = document.createElement('div');
-      pillRow.className = 'acp-tl-pill-row';
-      for (const item of searchPills) {
-        const pill = document.createElement('span');
-        pill.className = 'acp-tl-search-pill';
-        pill.innerHTML = SEARCH_ICON;
-        const pillText = document.createElement('span');
-        pillText.textContent = item.text;
-        pill.appendChild(pillText);
-        pillRow.appendChild(pill);
-      }
-      content.appendChild(pillRow);
-      step.append(dot, content);
-      fragment.appendChild(step);
-    }
 
-    // "Reviewing sources" step with fetched links
-    if (fetchSources.length > 0) {
-      const step = document.createElement('div');
-      step.className = 'acp-tl-step acp-tl-step--sources';
-      const dot = document.createElement('div');
-      dot.className = 'acp-tl-dot';
-      const content = document.createElement('div');
-      content.className = 'acp-tl-content';
+      const labelRow = document.createElement('div');
+      labelRow.className = 'acp-tl-tool-label-row';
+      const icon = document.createElement('span');
+      icon.className = 'acp-tl-tool-icon';
+      icon.innerHTML = TOOL_ICON;
       const label = document.createElement('span');
       label.className = 'acp-tl-group-label';
-      label.textContent = 'Reviewing sources';
-      content.appendChild(label);
-      const sourceList = document.createElement('div');
-      sourceList.className = 'acp-tl-source-list';
-      for (const src of fetchSources) {
-        const row = document.createElement('div');
-        row.className = 'acp-tl-source-row';
-        const favicon = document.createElement('img');
-        favicon.className = 'acp-tl-source-favicon';
-        favicon.src = `https://www.google.com/s2/favicons?domain=${src.domain}&sz=32`;
-        favicon.alt = '';
-        favicon.width = 16;
-        favicon.height = 16;
-        const link = document.createElement('a');
-        link.className = 'acp-tl-source-link';
-        link.href = src.url;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.textContent = src.url;
-        const domainEl = document.createElement('span');
-        domainEl.className = 'acp-tl-source-domain';
-        domainEl.textContent = src.domain;
-        row.append(favicon, link, domainEl);
-        sourceList.appendChild(row);
+      label.textContent = chunk.toolName || 'Tool call';
+      labelRow.append(icon, label);
+
+      if (chunk.status && chunk.status !== 'pending') {
+        const badge = document.createElement('span');
+        badge.className = 'acp-tl-status';
+        badge.textContent = chunk.status.replace(/_/g, ' ');
+        labelRow.appendChild(badge);
       }
-      content.appendChild(sourceList);
+      content.appendChild(labelRow);
+
+      // Collapsible input/result
+      if (chunk.input || chunk.result) {
+        const details = document.createElement('details');
+        details.className = 'acp-tl-tool-details';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Details';
+        details.appendChild(summary);
+        if (chunk.input) {
+          const inputLabel = document.createElement('div');
+          inputLabel.className = 'acp-tl-detail-label';
+          inputLabel.textContent = 'Input';
+          const inputPre = document.createElement('pre');
+          inputPre.textContent = chunk.input;
+          details.append(inputLabel, inputPre);
+        }
+        if (chunk.result) {
+          const resultLabel = document.createElement('div');
+          resultLabel.className = 'acp-tl-detail-label';
+          resultLabel.textContent = 'Result';
+          const resultPre = document.createElement('pre');
+          resultPre.textContent = chunk.result;
+          details.append(resultLabel, resultPre);
+        }
+        content.appendChild(details);
+      }
+
       step.append(dot, content);
       fragment.appendChild(step);
+      i++;
     }
 
     // "Finished" step
@@ -1460,9 +1586,8 @@
   function renderThinkingBlock(transcript) {
     const chunks = transcript.thinkingChunks;
     const isActive = transcript.thinkingActive;
-    const hasWebTools = chunks.some((c) => c.kind === 'tool' && c.toolKind);
-    // Only show thinking block when web tools are involved
-    if (!hasWebTools) {
+    const hasToolOrThought = chunks.length > 0;
+    if (!hasToolOrThought) {
       if (_thinkingEl) {
         _thinkingEl = null;
         _thinkingRenderedCount = 0;
